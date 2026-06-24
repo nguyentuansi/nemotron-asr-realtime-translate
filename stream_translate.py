@@ -166,6 +166,15 @@ def strip_lang_tags(text):
     return LANG_TAG_RE.sub("", text).rstrip()
 
 
+def has_real_content(text: str, min_word_chars: int = 2) -> bool:
+    """True if text has at least min_word_chars alphabetic chars. Used to
+    suppress 'commit just a period' edge cases where the model only emits a
+    sentence-end punctuation + lang tag between two utterances — without this,
+    NLLB would be handed '.' and hallucinate something like 'I'm not.'
+    """
+    return sum(1 for c in text if c.isalpha()) >= min_word_chars
+
+
 class Display:
     """Two-line live area at the bottom of the terminal:
 
@@ -524,8 +533,15 @@ def main():
         nonlocal commits_since_reset
         new_raw = raw_text_now[committed_raw_len:]
         finalized = strip_lang_tags(new_raw).strip()
-        if not finalized:
-            LOG.debug("commit_skipped reason=%s empty new_raw=%r", reason, new_raw)
+        if not finalized or not has_real_content(finalized):
+            # Skip-and-advance: just a period or whitespace between two real
+            # utterances. Move committed_raw_len past it but don't show or
+            # translate. Without this NLLB hands back hallucinations like
+            # "I'm not." for a single '.' input.
+            LOG.debug("commit_skipped reason=%s no_content new_raw=%r", reason, new_raw)
+            committed_raw_len = len(raw_text_now)
+            last_partial = ""
+            chunks_since_change = 0
             return
         LOG.info(
             "COMMIT reason=%s text=%r  (committed_so_far=%d -> %d)",
@@ -709,7 +725,7 @@ def main():
                 # submit the current partial for translation if it's grown
                 # enough to be worth translating again. The translator's
                 # single-slot draft queue keeps only the latest.
-                if draft_enabled and new_clean:
+                if draft_enabled and new_clean and has_real_content(new_clean):
                     now = time.time()
                     grew_enough = abs(len(new_clean) - len(last_draft_text)) >= 3
                     if (now - last_draft_at >= args.draft_secs
