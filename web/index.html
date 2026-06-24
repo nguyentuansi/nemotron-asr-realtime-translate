@@ -1,0 +1,348 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>nemotron-asr · live translate</title>
+  <style>
+    :root {
+      --bg: #fafaf7;
+      --paper: #ffffff;
+      --ink: #1f1f1f;
+      --ink-soft: #5a5a5a;
+      --ink-faint: #b3b3b3;
+      --rule: #ececec;
+      --accent: #1a7f5a;
+      --accent-bg: #e6f4ee;
+      --warn: #b04040;
+      --warn-bg: #fbeae9;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      height: 100%;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: 'Iowan Old Style', 'Charter', Georgia, 'Times New Roman', serif;
+      font-size: 18px;
+      line-height: 1.55;
+    }
+    .meta-font {
+      font-family: 'SF Mono', 'JetBrains Mono', ui-monospace, 'Menlo', monospace;
+    }
+    .sans {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Helvetica Neue', sans-serif;
+    }
+
+    /* layout */
+    body {
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      min-height: 100vh;
+    }
+    header {
+      background: var(--paper);
+      border-bottom: 1px solid var(--rule);
+      padding: 0.65rem 1.5rem;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      font-size: 0.85rem;
+      color: var(--ink-soft);
+    }
+    header .title { font-weight: 600; color: var(--ink); }
+    header .lang-pair { margin-left: 0.6rem; color: var(--ink-soft); }
+    header .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.15rem 0.6rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      background: var(--accent-bg);
+      color: var(--accent);
+    }
+    header .pill.disconnected { background: var(--warn-bg); color: var(--warn); }
+    header .pill .dot {
+      width: 6px; height: 6px;
+      border-radius: 50%;
+      background: var(--accent);
+      animation: pulse 1.6s ease-in-out infinite;
+    }
+    header .pill.disconnected .dot { background: var(--warn); }
+    @keyframes pulse { 0%,100% { opacity: 0.5; } 50% { opacity: 1; } }
+
+    main {
+      max-width: 900px;
+      margin: 0 auto;
+      padding: 2.5rem 2rem 1.5rem;
+      width: 100%;
+    }
+
+    .pane {
+      background: var(--paper);
+      border: 1px solid var(--rule);
+      border-radius: 6px;
+      padding: 1.5rem 2rem;
+      margin-bottom: 1.25rem;
+      min-height: 6rem;
+      box-shadow: 0 1px 0 rgba(0,0,0,0.02);
+    }
+    .pane h2 {
+      font-family: -apple-system, BlinkMacSystemFont, 'Inter', sans-serif;
+      font-size: 0.65rem;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      margin: 0 0 0.85rem;
+      font-weight: 600;
+    }
+    .pane p {
+      margin: 0;
+      font-size: 1.25rem;
+      line-height: 1.65;
+    }
+
+    /* The two states the user described:
+       - committed text: normal weight, normal ink
+       - live (partial/draft): italic, lightgrey
+    */
+    .committed { color: var(--ink); }
+    .live {
+      color: var(--ink-faint);
+      font-style: italic;
+    }
+    /* Subtle blinking caret at the live tail so we can see the stream is alive. */
+    .live::after {
+      content: '▎';
+      display: inline-block;
+      margin-left: 2px;
+      color: var(--ink-faint);
+      animation: caret 1s steps(2,end) infinite;
+    }
+    @keyframes caret { 0%,50% { opacity: 1; } 50.01%,100% { opacity: 0; } }
+
+    /* When the live span has no text yet, hide the caret so it doesn't dangle. */
+    .live:empty::after { opacity: 0.3; }
+
+    /* Translation pane: same parallel structure as source pane. */
+    .pane.translation .committed { color: var(--ink); }
+
+    footer {
+      border-top: 1px solid var(--rule);
+      padding: 0.5rem 1.5rem;
+      background: var(--paper);
+      display: flex;
+      gap: 1.5rem;
+      flex-wrap: wrap;
+      align-items: center;
+      font-size: 0.75rem;
+      color: var(--ink-soft);
+    }
+    footer .stat { display: flex; gap: 0.35rem; align-items: baseline; }
+    footer .stat .label { color: var(--ink-faint); text-transform: uppercase; letter-spacing: 0.1em; font-size: 0.65rem; }
+    footer .stat .value { color: var(--ink); font-weight: 500; }
+    footer .meter-bar {
+      display: inline-block;
+      letter-spacing: 0.05em;
+      color: var(--accent);
+    }
+
+    /* Empty-state hint inside a pane before any text arrives. */
+    .pane.empty p::before {
+      content: 'waiting for speech…';
+      color: var(--ink-faint);
+      font-style: italic;
+      font-size: 1rem;
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <span class="title">nemotron-asr</span>
+      <span class="lang-pair sans" id="lang-pair">— · — · —</span>
+    </div>
+    <div>
+      <span id="status" class="pill disconnected"><span class="dot"></span><span id="status-text">connecting</span></span>
+    </div>
+  </header>
+
+  <main>
+    <section class="pane source empty">
+      <h2>Source</h2>
+      <p><span class="committed" id="src-committed"></span><span class="live" id="src-live"></span></p>
+    </section>
+
+    <section class="pane translation empty">
+      <h2>Translation</h2>
+      <p><span class="committed" id="tgt-committed"></span><span class="live" id="tgt-live"></span></p>
+    </section>
+  </main>
+
+  <footer>
+    <div class="stat"><span class="label">step</span><span class="value meta-font" id="stat-step">0</span></div>
+    <div class="stat"><span class="label">commits</span><span class="value meta-font" id="stat-commits">0</span></div>
+    <div class="stat"><span class="label">peak</span><span class="meter-bar meta-font" id="stat-peak">▕··········▏</span></div>
+    <div class="stat"><span class="label">elapsed</span><span class="value meta-font" id="stat-elapsed">0.0s</span></div>
+    <div class="stat"><span class="label">trans</span><span class="value meta-font" id="stat-trans">— ms</span></div>
+  </footer>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    const els = {
+      status: $('status'),
+      statusText: $('status-text'),
+      langPair: $('lang-pair'),
+      srcPane: document.querySelector('.pane.source'),
+      tgtPane: document.querySelector('.pane.translation'),
+      srcCommitted: $('src-committed'),
+      srcLive: $('src-live'),
+      tgtCommitted: $('tgt-committed'),
+      tgtLive: $('tgt-live'),
+      step: $('stat-step'),
+      commits: $('stat-commits'),
+      peak: $('stat-peak'),
+      elapsed: $('stat-elapsed'),
+      trans: $('stat-trans'),
+    };
+
+    function setConnected(connected) {
+      els.status.classList.toggle('disconnected', !connected);
+      els.statusText.textContent = connected ? 'listening' : 'disconnected';
+    }
+
+    function renderCommitted(el, lines) {
+      // Each finalized utterance becomes a sentence in the flowing paragraph,
+      // separated by a single space so the paragraph reads naturally.
+      el.textContent = lines.join(' ') + (lines.length ? ' ' : '');
+    }
+
+    function setLive(el, text, paneEl) {
+      el.textContent = text || '';
+      // Drop the empty-state hint once any content arrives.
+      if (paneEl) {
+        const hasAny = (paneEl.querySelector('.committed').textContent.trim()
+                        || (text && text.trim()));
+        paneEl.classList.toggle('empty', !hasAny);
+      }
+    }
+
+    function peakBar(peak, width = 10) {
+      if (!peak || peak <= 1e-6) return '▕' + '·'.repeat(width) + '▏';
+      const db = 20.0 * Math.log10(peak);
+      let n = Math.round(Math.max(0, Math.min(width, ((db + 60.0) / 60.0) * width)));
+      return '▕' + '█'.repeat(n) + '·'.repeat(width - n) + '▏';
+    }
+
+    const state = {
+      sourceLines: [],
+      translationLines: [],
+      currentPartial: '',
+      currentDraft: '',
+    };
+
+    function applyState(s) {
+      state.sourceLines = s.source_lines || [];
+      state.translationLines = s.translation_lines || [];
+      state.currentPartial = s.current_partial || '';
+      state.currentDraft = s.current_draft || '';
+      if (s.config) {
+        const cfg = s.config;
+        const pair = `${cfg.src_lang || '—'} → ${cfg.tgt_lang || '—'}`;
+        const chunk = cfg.chunk_label ? ` · ${cfg.chunk_label}` : '';
+        els.langPair.textContent = `· ${pair}${chunk}`;
+      }
+      if (s.stats) applyStats(s.stats, null);
+      renderCommitted(els.srcCommitted, state.sourceLines);
+      renderCommitted(els.tgtCommitted, state.translationLines);
+      setLive(els.srcLive, state.currentPartial, els.srcPane);
+      setLive(els.tgtLive, state.currentDraft, els.tgtPane);
+    }
+
+    function applyStats(stats, lastTransMs) {
+      if (stats.step !== undefined) els.step.textContent = stats.step;
+      if (stats.commits !== undefined) els.commits.textContent = stats.commits;
+      if (stats.peak !== undefined) els.peak.textContent = peakBar(stats.peak);
+      if (stats.elapsed_s !== undefined) els.elapsed.textContent = stats.elapsed_s.toFixed(1) + 's';
+      if (lastTransMs !== null && lastTransMs !== undefined) {
+        els.trans.textContent = lastTransMs + ' ms';
+      }
+    }
+
+    function connect() {
+      const url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host + '/ws';
+      const ws = new WebSocket(url);
+      ws.onopen = () => setConnected(true);
+      ws.onclose = () => {
+        setConnected(false);
+        setTimeout(connect, 1000);  // auto-reconnect
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (msg) => {
+        let ev;
+        try { ev = JSON.parse(msg.data); } catch (e) { return; }
+        handle(ev);
+      };
+    }
+
+    function handle(ev) {
+      switch (ev.type) {
+        case 'state':
+          applyState(ev);
+          break;
+        case 'config':
+          if (ev.src_lang || ev.tgt_lang || ev.chunk_label) {
+            const pair = `${ev.src_lang || '—'} → ${ev.tgt_lang || '—'}`;
+            const chunk = ev.chunk_label ? ` · ${ev.chunk_label}` : '';
+            els.langPair.textContent = `· ${pair}${chunk}`;
+          }
+          break;
+        case 'partial':
+          state.currentPartial = ev.text || '';
+          setLive(els.srcLive, state.currentPartial, els.srcPane);
+          applyStats(ev, null);
+          break;
+        case 'draft':
+          state.currentDraft = ev.text || '';
+          setLive(els.tgtLive, state.currentDraft, els.tgtPane);
+          if (ev.ms !== undefined) applyStats({}, ev.ms);
+          break;
+        case 'commit_source':
+          state.sourceLines.push(ev.text);
+          state.currentPartial = '';
+          renderCommitted(els.srcCommitted, state.sourceLines);
+          setLive(els.srcLive, '', els.srcPane);
+          els.commits.textContent = state.sourceLines.length;
+          // Scroll source pane into view so the latest committed text stays visible.
+          els.srcPane.scrollIntoView({ behavior: 'smooth', block: 'end' });
+          break;
+        case 'commit_translation':
+          state.translationLines.push(ev.text);
+          state.currentDraft = '';
+          renderCommitted(els.tgtCommitted, state.translationLines);
+          setLive(els.tgtLive, '', els.tgtPane);
+          if (ev.ms !== undefined) applyStats({}, ev.ms);
+          els.tgtPane.scrollIntoView({ behavior: 'smooth', block: 'end' });
+          break;
+        case 'reset':
+          state.sourceLines = ev.preserve ? state.sourceLines : [];
+          state.translationLines = ev.preserve ? state.translationLines : [];
+          state.currentPartial = '';
+          state.currentDraft = '';
+          if (!ev.preserve) {
+            renderCommitted(els.srcCommitted, state.sourceLines);
+            renderCommitted(els.tgtCommitted, state.translationLines);
+          }
+          setLive(els.srcLive, '', els.srcPane);
+          setLive(els.tgtLive, '', els.tgtPane);
+          break;
+      }
+    }
+
+    connect();
+  </script>
+</body>
+</html>
