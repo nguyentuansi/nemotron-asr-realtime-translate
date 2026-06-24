@@ -167,17 +167,26 @@ def strip_lang_tags(text):
 
 
 class Display:
-    """Thread-safe console writer. Owns the 'live partial' slot at the bottom of
-    the visible region. Prints from any thread route through here so the live
-    line is always redrawn after a scrolling write.
+    """Two-line live area at the bottom of the terminal:
 
-    Critical: the live partial MUST be truncated to terminal width. If it wraps,
-    '\\r' only returns to col 0 of the current visual line — wrap residue stays
-    and the next write paints below it, producing the stair-step bug.
+        [partial]            <- live ASR partial, updates every chunk
+          ⤳ [draft trans]    <- in-flight (draft) translation, updates as
+                                streaming-translate workers produce results
+
+    Above the live area, finalized utterances scroll naturally:
+
+        Hôm nay là thứ mấy?
+          ↳ What day is it today?
+
+    Cursor invariant: after every call, cursor sits at column 0 of the TOP
+    line of the live area. _erase_live wipes from cursor to end of screen;
+    _draw_live writes both live lines and parks cursor back at the top.
     """
     def __init__(self):
         self._lock = threading.Lock()
         self._partial = ""
+        self._draft_trans = ""
+        self._drawn_rows = 0
 
     def _term_width(self):
         try:
@@ -187,37 +196,81 @@ class Display:
 
     def _truncate(self, text):
         w = self._term_width()
-        # Trim from the LEFT so the most recent words stay visible.
         if len(text) > w:
             text = "…" + text[-(w - 1):]
         return text
 
+    def _erase_live(self):
+        # Move up to the top line of live area, clear from cursor to end of screen.
+        if self._drawn_rows > 1:
+            sys.stdout.write(f"\r\x1b[{self._drawn_rows - 1}A")
+        sys.stdout.write("\r\x1b[J")
+        self._drawn_rows = 0
+
+    def _draw_live(self):
+        lines = [self._truncate(self._partial)]
+        if self._draft_trans:
+            lines.append(self._truncate(f"  ⤳ {self._draft_trans}"))
+        # Write each line; newline between but not after the last (cursor stays
+        # at end of last line). Then \r + cursor up to top of live area.
+        for i, ln in enumerate(lines):
+            if i > 0:
+                sys.stdout.write("\n")
+            sys.stdout.write(ln)
+        self._drawn_rows = len(lines)
+        if self._drawn_rows > 1:
+            sys.stdout.write(f"\r\x1b[{self._drawn_rows - 1}A")
+        else:
+            sys.stdout.write("\r")
+        sys.stdout.flush()
+
     def update_partial(self, text):
         with self._lock:
             self._partial = text
-            sys.stdout.write(f"\r\x1b[2K{self._truncate(text)}")
-            sys.stdout.flush()
+            self._erase_live()
+            self._draw_live()
+
+    def update_draft_translation(self, text):
+        with self._lock:
+            self._draft_trans = text
+            self._erase_live()
+            self._draw_live()
 
     def commit(self, orig, translated=None):
-        """Append a finalized utterance above the live partial line."""
+        """Move the live area into history — orig (and translated if known)
+        become scrolled-up lines. Clear live state for the next utterance."""
         with self._lock:
-            sys.stdout.write(f"\r\x1b[2K{orig}\n")
+            self._erase_live()
+            sys.stdout.write(f"{orig}\n")
             if translated is not None:
                 sys.stdout.write(f"  ↳ {translated}\n")
-            sys.stdout.write(self._truncate(self._partial))
-            sys.stdout.flush()
+            self._partial = ""
+            self._draft_trans = ""
+            self._draw_live()
 
     def append_translation(self, translated):
-        """Print just a translation line (the original was already shown)."""
+        """A final translation arrived after its source was already printed.
+        Insert it above the live area and clear any draft slot."""
         with self._lock:
-            sys.stdout.write(f"\r\x1b[2K  ↳ {translated}\n")
-            sys.stdout.write(self._truncate(self._partial))
-            sys.stdout.flush()
+            self._erase_live()
+            sys.stdout.write(f"  ↳ {translated}\n")
+            self._draft_trans = ""
+            self._draw_live()
 
 
 class Translator:
-    """Background NLLB-200 worker. Pulls (utt_id, text) tuples off a queue,
-    translates, and emits the translation through Display.append_translation().
+    """Background NLLB-200 worker handling two job classes:
+
+      - FINAL: commit-triggered translations. FIFO queue. Each result is
+        written above the live area via Display.append_translation().
+
+      - DRAFT: in-flight translations of the current ASR partial. Single-slot
+        — only the LATEST draft text is kept; older drafts are discarded if
+        new ones land before the worker picks them up. Result is written into
+        the live area via Display.update_draft_translation().
+
+    FINAL is always drained before DRAFT, so a real commit never gets stuck
+    behind speculative work.
     """
     def __init__(self, model_dir, src_lang, tgt_lang, display, device="cpu",
                  compute_type="int8", beam_size=2):
@@ -228,39 +281,70 @@ class Translator:
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
         self.display = display
-        self.queue = queue.Queue()
+        self._final_queue = queue.Queue()
+        self._draft_text = None
+        self._draft_lock = threading.Lock()
+        self._wake = threading.Event()
+        self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
     def start(self):
         self._thread.start()
 
-    def submit(self, text):
-        self.queue.put(text)
+    def submit_final(self, text):
+        self._final_queue.put(text)
+        self._wake.set()
+
+    def submit_draft(self, text):
+        with self._draft_lock:
+            self._draft_text = text
+        self._wake.set()
 
     def shutdown(self, drain_timeout=10.0):
-        """Signal the worker to drain its queue then exit. Called from main on
-        Ctrl-C — without this, ctranslate2's C++ threads get killed mid-call and
-        std::terminate() fires SIGABRT after Python exits."""
-        self.queue.put(None)
+        """Drain finals then exit. Drafts are dropped on shutdown."""
+        self._stop.set()
+        self._final_queue.put(None)
+        self._wake.set()
         self._thread.join(timeout=drain_timeout)
 
     def _run(self):
-        while True:
-            text = self.queue.get()
-            if text is None:
-                LOG.debug("translator worker received sentinel, exiting")
-                return
-            try:
-                t0 = time.time()
-                out = self.model.translate(text, self.src_lang, self.tgt_lang)
-                dt_ms = (time.time() - t0) * 1000
-                LOG.info(
-                    "trans %dms in_len=%d out_len=%d  in=%r -> out=%r",
-                    int(dt_ms), len(text), len(out), text, out,
-                )
+        while not self._stop.is_set():
+            self._wake.wait(timeout=0.25)
+            self._wake.clear()
+            # FINAL queue drains first.
+            while True:
+                try:
+                    text = self._final_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if text is None:
+                    LOG.debug("translator worker received sentinel, exiting")
+                    return
+                self._translate(text, is_final=True)
+            # Then a single DRAFT, using the most recent submission.
+            with self._draft_lock:
+                draft = self._draft_text
+                self._draft_text = None
+            if draft:
+                self._translate(draft, is_final=False)
+
+    def _translate(self, text, is_final):
+        try:
+            t0 = time.time()
+            out = self.model.translate(text, self.src_lang, self.tgt_lang)
+            dt_ms = (time.time() - t0) * 1000
+            kind = "FINAL" if is_final else "draft"
+            LOG.info(
+                "trans %s %dms in_len=%d out_len=%d  in=%r -> out=%r",
+                kind, int(dt_ms), len(text), len(out), text, out,
+            )
+            if is_final:
                 self.display.append_translation(f"{out}  [{dt_ms:.0f}ms]")
-            except Exception as e:
-                LOG.exception("translation failed for %r", text)
+            else:
+                self.display.update_draft_translation(out)
+        except Exception as e:
+            LOG.exception("translation failed for %r", text)
+            if is_final:
                 self.display.append_translation(f"[trans error: {type(e).__name__}: {e}]")
 
 
@@ -280,16 +364,22 @@ def main():
                     help="device for the NLLB translator (default: cpu; keeps GPU for ASR)")
     ap.add_argument("--watchdog", type=int, default=25,
                     help="commit + reset RNNT after N chunks with no new tokens (0=off)")
-    ap.add_argument("--max-utterance-secs", type=float, default=6.0,
-                    help="force a commit when the current utterance has been running for "
-                         "more than N seconds (prevents continuous speech from never committing)")
-    ap.add_argument("--max-utterance-chars", type=int, default=120,
+    ap.add_argument("--max-utterance-secs", type=float, default=12.0,
+                    help="hard ceiling — force a commit when the current utterance has been "
+                         "running for more than N seconds (don't go below ~10s or you fragment "
+                         "natural Vietnamese reading)")
+    ap.add_argument("--max-utterance-chars", type=int, default=240,
                     help="hard cap on running-partial length before a forced commit")
-    ap.add_argument("--silence-secs", type=float, default=1.0,
-                    help="commit when mic audio stays below --silence-threshold for this long "
-                         "(VAD-style endpointing — the main 'feels realtime' lever; 0 to disable)")
+    ap.add_argument("--silence-secs", type=float, default=2.0,
+                    help="commit when mic audio stays below --silence-threshold for this long. "
+                         "Default 2s is conservative on purpose: a 1s gap is just a Vietnamese "
+                         "phrasing pause, not an utterance end. 0 to disable.")
     ap.add_argument("--silence-threshold", type=float, default=0.025,
                     help="audio peak below this counts as silence (linear, 0..1)")
+    ap.add_argument("--draft-secs", type=float, default=1.0,
+                    help="re-translate the live partial as a draft every N seconds while you "
+                         "keep speaking, so a translation is visible BEFORE you pause. "
+                         "0 to disable streaming drafts.")
     ap.add_argument("--render-hz", type=float, default=10.0,
                     help="live partial redraw rate (lower = less terminal flicker)")
     ap.add_argument("--beam-size", type=int, default=2,
@@ -383,15 +473,19 @@ def main():
     committed_raw_len = 0
     latest_raw_text = ""  # most recent hypothesis text, used by Ctrl-C handler.
     chunks_below_silence = 0
-    # Round UP so silence_secs=1.0 with a 0.56s chunk gives 2 chunks (1.12s),
-    # not 1 chunk (0.56s) — a 0.56s gap is just a between-word pause.
     silence_chunks_needed = (max(2, math.ceil(args.silence_secs / chunk_secs))
                              if args.silence_secs > 0 else 0)
     if silence_chunks_needed > 0:
         print(f"[cfg]    silence VAD: peak<{args.silence_threshold} for "
               f"{silence_chunks_needed} chunks ({silence_chunks_needed * chunk_secs:.1f}s) "
               f"-> commit", flush=True)
-    # Sentence terminators: covers Latin punctuation + Vietnamese spoken-style endings.
+    # Streaming draft translation state.
+    draft_enabled = args.draft_secs > 0 and translator is not None
+    last_draft_at = 0.0
+    last_draft_text = ""
+    if draft_enabled:
+        print(f"[cfg]    streaming drafts every {args.draft_secs:.1f}s while speaking",
+              flush=True)
     SENTENCE_END = ".!?。！？"
 
     def render_partial(force=False):
@@ -412,7 +506,7 @@ def main():
         our committed-up-to pointer forward.
         """
         nonlocal committed_raw_len, last_partial, chunks_since_change
-        nonlocal utterance_started_at
+        nonlocal utterance_started_at, last_draft_text, last_draft_at
         new_raw = raw_text_now[committed_raw_len:]
         finalized = strip_lang_tags(new_raw).strip()
         if not finalized:
@@ -424,11 +518,17 @@ def main():
         )
         display.commit(finalized)
         if translator is not None:
-            translator.submit(finalized)
+            translator.submit_final(finalized)
         committed_raw_len = len(raw_text_now)
         last_partial = ""
         chunks_since_change = 0
         utterance_started_at = time.time()
+        # Reset draft state so the next utterance gets a fresh draft cycle.
+        # The translator's single-slot draft queue is already replaced when a
+        # new draft is submitted; any in-flight stale draft will land in the
+        # newly-empty live area, which is fine.
+        last_draft_text = ""
+        last_draft_at = time.time()
 
     try:
         while True:
@@ -533,6 +633,21 @@ def main():
                 if args.watchdog > 0 and chunks_since_change >= args.watchdog and new_clean:
                     commit_utterance(raw_text, reason=f"watchdog={args.watchdog}")
                     continue
+
+                # Streaming draft translation: every --draft-secs of wall time,
+                # submit the current partial for translation if it's grown
+                # enough to be worth translating again. The translator's
+                # single-slot draft queue keeps only the latest.
+                if draft_enabled and new_clean:
+                    now = time.time()
+                    grew_enough = abs(len(new_clean) - len(last_draft_text)) >= 3
+                    if (now - last_draft_at >= args.draft_secs
+                            and grew_enough
+                            and new_clean != last_draft_text):
+                        translator.submit_draft(new_clean)
+                        last_draft_text = new_clean
+                        last_draft_at = now
+                        LOG.debug("submit_draft len=%d text=%r", len(new_clean), new_clean[:80])
 
             render_partial()
     except KeyboardInterrupt:
