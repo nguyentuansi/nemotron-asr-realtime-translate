@@ -201,9 +201,13 @@ class Display:
         return text
 
     def _erase_live(self):
-        # Move up to the top line of live area, clear from cursor to end of screen.
-        if self._drawn_rows > 1:
-            sys.stdout.write(f"\r\x1b[{self._drawn_rows - 1}A")
+        # Invariant: every method LEAVES the cursor at the top of the live area.
+        # So erasing is just "clear from current position to end of screen" —
+        # no cursor movement needed.
+        #
+        # (Prior bug: we also moved cursor up by drawn_rows-1 here, which after
+        # _draw_live had already parked at the top meant we moved INTO history
+        # and then erased one history row every redraw.)
         sys.stdout.write("\r\x1b[J")
         self._drawn_rows = 0
 
@@ -380,6 +384,14 @@ def main():
                     help="re-translate the live partial as a draft every N seconds while you "
                          "keep speaking, so a translation is visible BEFORE you pause. "
                          "0 to disable streaming drafts.")
+    ap.add_argument("--full-reset-after", type=int, default=4,
+                    help="full ASR state reset (encoder caches + RNNT + audio buffer) after "
+                         "N commits. Prevents the RNNT decoder getting stuck after accumulating "
+                         "many <lang> end-of-utterance tags in its running hypothesis. "
+                         "0 = never (will eventually freeze).")
+    ap.add_argument("--full-reset-secs", type=float, default=45.0,
+                    help="periodic full ASR state reset every N seconds, whichever fires first "
+                         "vs --full-reset-after. 0 = never.")
     ap.add_argument("--render-hz", type=float, default=10.0,
                     help="live partial redraw rate (lower = less terminal flicker)")
     ap.add_argument("--beam-size", type=int, default=2,
@@ -486,6 +498,13 @@ def main():
     if draft_enabled:
         print(f"[cfg]    streaming drafts every {args.draft_secs:.1f}s while speaking",
               flush=True)
+    # Periodic full-reset state — bounds RNNT hypothesis growth and prevents the
+    # 'decoder thinks the stream is over' freeze after multiple <lang> tags pile up.
+    commits_since_reset = 0
+    last_full_reset_at = time.time()
+    if args.full_reset_after > 0 or args.full_reset_secs > 0:
+        print(f"[cfg]    full ASR reset every {args.full_reset_after} commits "
+              f"or {args.full_reset_secs:.0f}s", flush=True)
     SENTENCE_END = ".!?。！？"
 
     def render_partial(force=False):
@@ -500,13 +519,9 @@ def main():
         display.update_partial(f"[{elapsed:6.1f}s #{step:4d} {bar}] {body}")
 
     def commit_utterance(raw_text_now, reason):
-        """Take everything in raw_text_now after the last commit point, finalize
-        it as one line, submit for translation. We do NOT reset RNNT state —
-        the model keeps decoding into the same growing hypothesis; we just move
-        our committed-up-to pointer forward.
-        """
         nonlocal committed_raw_len, last_partial, chunks_since_change
         nonlocal utterance_started_at, last_draft_text, last_draft_at
+        nonlocal commits_since_reset
         new_raw = raw_text_now[committed_raw_len:]
         finalized = strip_lang_tags(new_raw).strip()
         if not finalized:
@@ -523,12 +538,52 @@ def main():
         last_partial = ""
         chunks_since_change = 0
         utterance_started_at = time.time()
-        # Reset draft state so the next utterance gets a fresh draft cycle.
-        # The translator's single-slot draft queue is already replaced when a
-        # new draft is submitted; any in-flight stale draft will land in the
-        # newly-empty live area, which is fine.
         last_draft_text = ""
         last_draft_at = time.time()
+        commits_since_reset += 1
+
+    def maybe_full_reset():
+        """Return True if a full state reset just happened. The RNNT decoder
+        otherwise gets stuck after accumulating ~3-4 <lang> tags — it treats
+        the stream as finished and emits only blanks for new audio. Periodic
+        full reset clears encoder caches + RNNT state + streaming buffer."""
+        nonlocal cache_last_channel, cache_last_time, cache_last_channel_len
+        nonlocal previous_hypotheses, pred_out_stream, committed_raw_len
+        nonlocal streaming_buffer, step, commits_since_reset, last_full_reset_at
+        nonlocal last_partial, latest_raw_text, chunks_since_change
+        nonlocal chunks_below_silence, last_draft_text, last_draft_at
+        nonlocal utterance_started_at
+
+        need = False
+        why = ""
+        if args.full_reset_after > 0 and commits_since_reset >= args.full_reset_after:
+            need, why = True, f"commits={commits_since_reset}"
+        elif (args.full_reset_secs > 0
+              and time.time() - last_full_reset_at >= args.full_reset_secs):
+            need, why = True, f"age={time.time() - last_full_reset_at:.0f}s"
+        if not need:
+            return False
+        LOG.info("FULL_RESET %s", why)
+        cache_last_channel, cache_last_time, cache_last_channel_len = (
+            model.encoder.get_initial_cache_state(batch_size=1, device=dev_torch)
+        )
+        previous_hypotheses = None
+        pred_out_stream = None
+        committed_raw_len = 0
+        streaming_buffer = CacheAwareStreamingAudioBuffer(
+            model=model, online_normalization=True,
+        )
+        step = 0
+        commits_since_reset = 0
+        last_full_reset_at = time.time()
+        last_partial = ""
+        latest_raw_text = ""
+        chunks_since_change = 0
+        chunks_below_silence = 0
+        last_draft_text = ""
+        last_draft_at = time.time()
+        utterance_started_at = time.time()
+        return True
 
     try:
         while True:
@@ -539,8 +594,14 @@ def main():
                 continue
             sid = -1 if streaming_buffer.buffer is None else 0
             streaming_buffer.append_audio(chunk_audio_raw, stream_id=sid)
-            while (streaming_buffer.buffer.size(-1) - streaming_buffer.buffer_idx
-                   >= required_remaining(step)):
+            while True:
+                # Guard against the freshly-empty buffer that maybe_full_reset()
+                # leaves behind — its .buffer is None until the next append.
+                if streaming_buffer.buffer is None:
+                    break
+                if (streaming_buffer.buffer.size(-1) - streaming_buffer.buffer_idx
+                        < required_remaining(step)):
+                    break
                 gen = iter(streaming_buffer)
                 try:
                     chunk_audio, chunk_lengths = next(gen)
@@ -598,15 +659,17 @@ def main():
                 if tags and stripped.endswith(tags[-1]):
                     commit_utterance(raw_text, reason="lang_tag")
                     chunks_below_silence = 0
+                    if maybe_full_reset():
+                        break
                     continue
                 # Sentence-final punctuation.
                 if new_clean and new_clean[-1] in SENTENCE_END:
                     commit_utterance(raw_text, reason="punctuation")
                     chunks_below_silence = 0
+                    if maybe_full_reset():
+                        break
                     continue
                 # Silence-based: mic dropped below threshold for long enough.
-                # This is the main 'feels realtime' lever — commits ~1s after
-                # speech ends, not 6+ seconds via the time fallback.
                 if (silence_chunks_needed > 0
                         and chunks_below_silence >= silence_chunks_needed
                         and new_clean):
@@ -615,16 +678,22 @@ def main():
                         reason=f"silence_{chunks_below_silence}chk_peak={cur_peak:.3f}",
                     )
                     chunks_below_silence = 0
+                    if maybe_full_reset():
+                        break
                     continue
                 # Time-based: long-running utterance, fallback.
                 utt_age = time.time() - utterance_started_at
                 if (args.max_utterance_secs > 0 and new_clean
                         and utt_age >= args.max_utterance_secs):
                     commit_utterance(raw_text, reason=f"max_secs={args.max_utterance_secs}")
+                    if maybe_full_reset():
+                        break
                     continue
                 # Hard char cap.
                 if args.max_utterance_chars > 0 and len(new_clean) >= args.max_utterance_chars:
                     commit_utterance(raw_text, reason=f"max_chars={args.max_utterance_chars}")
+                    if maybe_full_reset():
+                        break
                     continue
 
                 last_partial = new_raw
@@ -632,6 +701,8 @@ def main():
                 # Watchdog: text hasn't changed for N chunks.
                 if args.watchdog > 0 and chunks_since_change >= args.watchdog and new_clean:
                     commit_utterance(raw_text, reason=f"watchdog={args.watchdog}")
+                    if maybe_full_reset():
+                        break
                     continue
 
                 # Streaming draft translation: every --draft-secs of wall time,
