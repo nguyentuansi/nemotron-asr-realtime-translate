@@ -19,6 +19,7 @@ Display:
 import argparse
 import datetime as _dt
 import logging
+import math
 import os
 import queue
 import re
@@ -279,11 +280,16 @@ def main():
                     help="device for the NLLB translator (default: cpu; keeps GPU for ASR)")
     ap.add_argument("--watchdog", type=int, default=25,
                     help="commit + reset RNNT after N chunks with no new tokens (0=off)")
-    ap.add_argument("--max-utterance-secs", type=float, default=8.0,
+    ap.add_argument("--max-utterance-secs", type=float, default=6.0,
                     help="force a commit when the current utterance has been running for "
                          "more than N seconds (prevents continuous speech from never committing)")
     ap.add_argument("--max-utterance-chars", type=int, default=120,
                     help="hard cap on running-partial length before a forced commit")
+    ap.add_argument("--silence-secs", type=float, default=1.0,
+                    help="commit when mic audio stays below --silence-threshold for this long "
+                         "(VAD-style endpointing — the main 'feels realtime' lever; 0 to disable)")
+    ap.add_argument("--silence-threshold", type=float, default=0.025,
+                    help="audio peak below this counts as silence (linear, 0..1)")
     ap.add_argument("--render-hz", type=float, default=10.0,
                     help="live partial redraw rate (lower = less terminal flicker)")
     ap.add_argument("--beam-size", type=int, default=2,
@@ -376,6 +382,15 @@ def main():
     # of the session.
     committed_raw_len = 0
     latest_raw_text = ""  # most recent hypothesis text, used by Ctrl-C handler.
+    chunks_below_silence = 0
+    # Round UP so silence_secs=1.0 with a 0.56s chunk gives 2 chunks (1.12s),
+    # not 1 chunk (0.56s) — a 0.56s gap is just a between-word pause.
+    silence_chunks_needed = (max(2, math.ceil(args.silence_secs / chunk_secs))
+                             if args.silence_secs > 0 else 0)
+    if silence_chunks_needed > 0:
+        print(f"[cfg]    silence VAD: peak<{args.silence_threshold} for "
+              f"{silence_chunks_needed} chunks ({silence_chunks_needed * chunk_secs:.1f}s) "
+              f"-> commit", flush=True)
     # Sentence terminators: covers Latin punctuation + Vietnamese spoken-style endings.
     SENTENCE_END = ".!?。！？"
 
@@ -465,22 +480,43 @@ def main():
                     chunks_since_change += 1
 
                 LOG.debug(
-                    "step=%d t=%.2fs peak=%.3f raw_len=%d committed=%d new=%r",
+                    "step=%d t=%.2fs peak=%.3f silc=%d raw_len=%d committed=%d new=%r",
                     step, time.time() - t_start, producer.peak(),
-                    len(raw_text), committed_raw_len, new_clean[:80],
+                    chunks_below_silence, len(raw_text), committed_raw_len, new_clean[:80],
                 )
+
+                # Track silence chunks (audio-level VAD).
+                cur_peak = producer.peak()
+                if cur_peak < args.silence_threshold:
+                    chunks_below_silence += 1
+                else:
+                    chunks_below_silence = 0
 
                 # End-of-utterance lang tag in the un-committed portion.
                 stripped = new_raw.rstrip()
                 tags = LANG_TAG_RE.findall(stripped)
                 if tags and stripped.endswith(tags[-1]):
                     commit_utterance(raw_text, reason="lang_tag")
+                    chunks_below_silence = 0
                     continue
                 # Sentence-final punctuation.
                 if new_clean and new_clean[-1] in SENTENCE_END:
                     commit_utterance(raw_text, reason="punctuation")
+                    chunks_below_silence = 0
                     continue
-                # Time-based: long-running utterance.
+                # Silence-based: mic dropped below threshold for long enough.
+                # This is the main 'feels realtime' lever — commits ~1s after
+                # speech ends, not 6+ seconds via the time fallback.
+                if (silence_chunks_needed > 0
+                        and chunks_below_silence >= silence_chunks_needed
+                        and new_clean):
+                    commit_utterance(
+                        raw_text,
+                        reason=f"silence_{chunks_below_silence}chk_peak={cur_peak:.3f}",
+                    )
+                    chunks_below_silence = 0
+                    continue
+                # Time-based: long-running utterance, fallback.
                 utt_age = time.time() - utterance_started_at
                 if (args.max_utterance_secs > 0 and new_clean
                         and utt_age >= args.max_utterance_secs):
