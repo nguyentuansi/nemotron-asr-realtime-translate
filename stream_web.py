@@ -41,6 +41,7 @@ import alsaaudio
 import numpy as np
 import torch
 
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, PlainTextResponse
 import uvicorn
@@ -348,9 +349,11 @@ class Translator:
 
 # ---------- ASR streaming loop ----------
 
-def run_asr_loop(args, broadcaster: Broadcaster, translator: Translator | None):
+def run_asr_loop(args, broadcaster: Broadcaster, translator: Translator | None, model):
+    """ASR streaming loop. `model` is preloaded in the main thread so the web
+    server doesn't start until ASR is ready — without this, the user opens the
+    browser, sees an empty page for 60-90 seconds, and assumes it's broken."""
     att_ctx = ATT_CONTEXT[args.chunk]
-    model = load_asr()
     model.encoder.set_default_att_context_size(att_ctx)
     try:
         model.set_inference_prompt(args.lang)
@@ -609,11 +612,16 @@ def run_asr_loop(args, broadcaster: Broadcaster, translator: Translator | None):
 # ---------- FastAPI app ----------
 
 def build_app(broadcaster: Broadcaster) -> FastAPI:
-    app = FastAPI(title="nemotron-asr live translate", docs_url=None, redoc_url=None)
-
-    @app.on_event("startup")
-    async def _on_startup():
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        # Capture the event loop so the sync ASR/translator threads can schedule
+        # broadcast coroutines on it via asyncio.run_coroutine_threadsafe.
         broadcaster.set_loop(asyncio.get_event_loop())
+        yield
+
+    app = FastAPI(title="nemotron-asr live translate",
+                  docs_url=None, redoc_url=None,
+                  lifespan=lifespan)
 
     @app.get("/", response_class=HTMLResponse)
     async def index():
@@ -691,14 +699,26 @@ def main():
         print(f"[nmt]  NLLB-200 int8 loaded in {time.time()-t0:.1f}s "
               f"on {args.translator_device} beam_size={args.beam_size}", flush=True)
 
+    # Load the ASR model in the MAIN thread BEFORE starting the web server.
+    # Loading takes 60-90s on first run; doing it inline means:
+    #   - clear console feedback ('loading model… X.Xs')
+    #   - the web server doesn't accept connections until the model is ready,
+    #     so a browser opened at the URL never sees a misleadingly empty page
+    #   - any model-load exception surfaces in the main thread (was hidden by
+    #     the daemon ASR thread before).
+    print(f"[asr]  loading nemotron-3.5-asr-streaming-0.6b "
+          f"(~60-90s on first run)...", flush=True)
+    model = load_asr()
+
     asr_thread = threading.Thread(
-        target=run_asr_loop, args=(args, broadcaster, translator), daemon=True,
+        target=_asr_thread_wrapper, args=(args, broadcaster, translator, model),
+        daemon=True, name="asr-loop",
     )
     asr_thread.start()
 
     app = build_app(broadcaster)
     url = f"http://{args.host}:{args.port}"
-    print(f"\n[web]  open {url} in a browser", flush=True)
+    print(f"\n[web]  ready — open {url} in a browser", flush=True)
     print(f"[stream] src={args.lang} -> tgt={args.target_lang} chunk={args.chunk}", flush=True)
 
     config = uvicorn.Config(app, host=args.host, port=args.port, log_level="warning",
@@ -710,6 +730,24 @@ def main():
         if translator is not None:
             translator.shutdown(drain_timeout=5.0)
         LOG.info("=== session end")
+
+
+def _asr_thread_wrapper(args, broadcaster, translator, model):
+    """Catch + log any exception from the ASR loop so a crash doesn't silently
+    leave the web UI looking idle. Daemon threads otherwise swallow tracebacks
+    to the default excepthook, which doesn't write to our LOG handler."""
+    try:
+        run_asr_loop(args, broadcaster, translator, model)
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        print(f"\n[asr]  FATAL: {type(e).__name__}: {e}\n{tb}", file=sys.stderr,
+              flush=True)
+        LOG.error("ASR loop crashed: %s\n%s", e, tb)
+        broadcaster.emit({
+            "type": "config",
+            "asr_error": f"{type(e).__name__}: {e}",
+        })
 
 
 if __name__ == "__main__":
