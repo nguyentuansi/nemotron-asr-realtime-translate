@@ -14,3 +14,7 @@ audio/_diag_*.json
 audio/smoke_manifest.json
 
 .claude/
+
+# Translation model — converted on first run via ct2-transformers-converter.
+# 621 MB int8; see translator.py docstring for the convert command.
+nllb-200-distilled-600M-ct2-int8/
