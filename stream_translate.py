@@ -20,6 +20,7 @@ import argparse
 import os
 import queue
 import re
+import shutil
 import sys
 import threading
 import time
@@ -141,15 +142,32 @@ class Display:
     """Thread-safe console writer. Owns the 'live partial' slot at the bottom of
     the visible region. Prints from any thread route through here so the live
     line is always redrawn after a scrolling write.
+
+    Critical: the live partial MUST be truncated to terminal width. If it wraps,
+    '\\r' only returns to col 0 of the current visual line — wrap residue stays
+    and the next write paints below it, producing the stair-step bug.
     """
     def __init__(self):
         self._lock = threading.Lock()
         self._partial = ""
 
+    def _term_width(self):
+        try:
+            return max(20, shutil.get_terminal_size((100, 24)).columns)
+        except OSError:
+            return 100
+
+    def _truncate(self, text):
+        w = self._term_width()
+        # Trim from the LEFT so the most recent words stay visible.
+        if len(text) > w:
+            text = "…" + text[-(w - 1):]
+        return text
+
     def update_partial(self, text):
         with self._lock:
             self._partial = text
-            sys.stdout.write(f"\r\x1b[2K{text}")
+            sys.stdout.write(f"\r\x1b[2K{self._truncate(text)}")
             sys.stdout.flush()
 
     def commit(self, orig, translated=None):
@@ -158,15 +176,14 @@ class Display:
             sys.stdout.write(f"\r\x1b[2K{orig}\n")
             if translated is not None:
                 sys.stdout.write(f"  ↳ {translated}\n")
-            # Redraw the live partial in place.
-            sys.stdout.write(self._partial)
+            sys.stdout.write(self._truncate(self._partial))
             sys.stdout.flush()
 
     def append_translation(self, translated):
         """Print just a translation line (the original was already shown)."""
         with self._lock:
             sys.stdout.write(f"\r\x1b[2K  ↳ {translated}\n")
-            sys.stdout.write(self._partial)
+            sys.stdout.write(self._truncate(self._partial))
             sys.stdout.flush()
 
 
@@ -189,6 +206,13 @@ class Translator:
 
     def submit(self, text):
         self.queue.put(text)
+
+    def shutdown(self, drain_timeout=10.0):
+        """Signal the worker to drain its queue then exit. Called from main on
+        Ctrl-C — without this, ctranslate2's C++ threads get killed mid-call and
+        std::terminate() fires SIGABRT after Python exits."""
+        self.queue.put(None)
+        self._thread.join(timeout=drain_timeout)
 
     def _run(self):
         while True:
@@ -220,6 +244,13 @@ def main():
                     help="device for the NLLB translator (default: cpu; keeps GPU for ASR)")
     ap.add_argument("--watchdog", type=int, default=25,
                     help="commit + reset RNNT after N chunks with no new tokens (0=off)")
+    ap.add_argument("--max-utterance-secs", type=float, default=8.0,
+                    help="force a commit when the current utterance has been running for "
+                         "more than N seconds (prevents continuous speech from never committing)")
+    ap.add_argument("--max-utterance-chars", type=int, default=120,
+                    help="hard cap on running-partial length before a forced commit")
+    ap.add_argument("--render-hz", type=float, default=10.0,
+                    help="live partial redraw rate (lower = less terminal flicker)")
     args = ap.parse_args()
 
     att_ctx = ATT_CONTEXT[args.chunk]
@@ -281,15 +312,26 @@ def main():
     last_partial = ""
     chunks_since_change = 0
     t_start = time.time()
+    last_render_t = 0.0
+    render_interval = 1.0 / max(1.0, args.render_hz)
+    utterance_started_at = time.time()
+    # Sentence terminators: covers Latin punctuation + Vietnamese spoken-style endings.
+    SENTENCE_END = ".!?。！？"
 
-    def render_partial():
-        elapsed = time.time() - t_start
+    def render_partial(force=False):
+        nonlocal last_render_t
+        now = time.time()
+        if not force and now - last_render_t < render_interval:
+            return
+        last_render_t = now
+        elapsed = now - t_start
         bar = level_bar(producer.peak())
         body = strip_lang_tags(last_partial) if last_partial else ""
         display.update_partial(f"[{elapsed:6.1f}s #{step:4d} {bar}] {body}")
 
     def commit_utterance(raw_text):
         nonlocal previous_hypotheses, pred_out_stream, last_partial, chunks_since_change
+        nonlocal utterance_started_at
         finalized = strip_lang_tags(raw_text).strip()
         if not finalized:
             return
@@ -300,13 +342,14 @@ def main():
         pred_out_stream = None
         last_partial = ""
         chunks_since_change = 0
+        utterance_started_at = time.time()
 
     try:
         while True:
             chunk_audio_raw = producer.take(chunk_samples)
             if chunk_audio_raw is None:
                 render_partial()
-                time.sleep(0.02)
+                time.sleep(0.05)
                 continue
             sid = -1 if streaming_buffer.buffer is None else 0
             streaming_buffer.append_audio(chunk_audio_raw, stream_id=sid)
@@ -350,6 +393,21 @@ def main():
                     commit_utterance(raw_text)
                     continue
 
+                # Mid-utterance commits to bound RNNT state when the user
+                # speaks continuously without the model emitting a tag.
+                clean = strip_lang_tags(raw_text).rstrip()
+                if clean and clean[-1] in SENTENCE_END:
+                    commit_utterance(raw_text)
+                    continue
+                utt_age = time.time() - utterance_started_at
+                if (args.max_utterance_secs > 0 and clean
+                        and utt_age >= args.max_utterance_secs):
+                    commit_utterance(raw_text)
+                    continue
+                if args.max_utterance_chars > 0 and len(clean) >= args.max_utterance_chars:
+                    commit_utterance(raw_text)
+                    continue
+
                 last_partial = raw_text
 
                 if args.watchdog > 0 and chunks_since_change >= args.watchdog and raw_text:
@@ -360,7 +418,11 @@ def main():
     except KeyboardInterrupt:
         if last_partial:
             commit_utterance(last_partial)
-        sys.stdout.write("\n[done]\n")
+        if translator is not None:
+            sys.stdout.write("\n[wait] draining translator queue...\n")
+            sys.stdout.flush()
+            translator.shutdown(drain_timeout=15.0)
+        sys.stdout.write("[done]\n")
         sys.stdout.flush()
     finally:
         producer.stop()
