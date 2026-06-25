@@ -1,4 +1,4 @@
-# nemotron-asr
+# nemotron-asr-realtime-translate
 
 **Real-time speech translation built on Nemotron-3.5 ASR.** Stream audio in
 any of **19 source languages** (English, Vietnamese, Chinese, Spanish, French,
@@ -75,8 +75,8 @@ This repo is the open answer: **any of Nemotron's 19 source languages → any of
 ## Quick start
 
 ```bash
-git clone <this repo>
-cd nemotron-asr
+git clone https://github.com/nguyentuansi/nemotron-asr-realtime-translate.git
+cd nemotron-asr-realtime-translate
 ./stream_translate.sh
 ```
 
@@ -215,7 +215,7 @@ All flags discoverable via `./stream_translate.sh --help`.
 ## Project layout
 
 ```
-nemotron-asr/
+nemotron-asr-realtime-translate/
 ├── stream_translate.sh   wrapper: ./stream_translate.py via _bootstrap.sh
 ├── stream_translate.py   terminal UI, streaming ASR + translation
 ├── stream_web.sh         wrapper: ./stream_web.py

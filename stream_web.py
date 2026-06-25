@@ -735,7 +735,7 @@ def build_app(broadcaster: Broadcaster) -> FastAPI:
         broadcaster.set_loop(asyncio.get_event_loop())
         yield
 
-    app = FastAPI(title="nemotron-asr live translate",
+    app = FastAPI(title="nemotron-asr-realtime-translate",
                   docs_url=None, redoc_url=None,
                   lifespan=lifespan)
 
