@@ -11,9 +11,10 @@ sub-second latency, defaults tuned for tone-language speech — but the same
 pipeline drives any other pair via `--lang` and `--target-lang`.
 
 <!--
-  demo/demo.gif is currently a MOCKUP rendered by demo/make-mockup.py
-  (watermarked "MOCKUP" in the corner). Replace it with a real screen
-  recording before any public launch — see demo/README.md.
+  demo/demo.gif is currently a programmatic mockup rendered by
+  demo/make-mockup.py — it faithfully mirrors stream_translate.py's live UI
+  (parallel ASR partial + translator draft, then commit). Replace it with a
+  real screen recording before any public launch — see demo/README.md.
 -->
 ![Demo: Vietnamese speech → English translation, live on a MacBook CPU](demo/demo.gif)
 

@@ -1,18 +1,17 @@
 """Render an animated terminal mockup of the demo for placeholder use.
 
-Output: demo/demo.gif (~3 MB, ~14 s loop, 960x540, 15 fps).
+Output: demo/demo.gif (960x540, 15 fps).
 
-This is a MOCKUP — it shows what the real demo would look like. Until a real
-recording is captured per demo/README.md, this file occupies the README's
-hero slot so the page isn't broken.
-
-The mockup is watermarked "MOCKUP" in the corner so it's never confused with
-the real recording.
+Mirrors the actual stream_translate.py UI behaviour: the ASR partial (Vi)
+and the in-flight translator draft (EN) both update concurrently in the
+"live area", EN trailing Vi by ~1 word because the background translator
+thread processes each new partial. On commit (silence/sentence-final),
+both lines move into history (`vi` + `  ↳ en`) and a fresh live area
+starts below for the next utterance.
 
 Run:
     .venv/bin/python demo/make-mockup.py
 """
-import os
 import shutil
 import subprocess
 import sys
@@ -26,40 +25,57 @@ OUT = HERE / "demo.gif"
 
 # Canvas
 W, H = 960, 540
-BG = (24, 26, 31)          # terminal background
-CHROME = (40, 44, 52)      # title bar
-DIM = (110, 118, 130)      # subdued text (loading, hints)
-TEXT = (220, 224, 230)     # default text
-PROMPT = (148, 226, 213)   # teal prompt
-USER = (240, 240, 240)     # what the user typed
-LISTENING = (255, 196, 96) # listening indicator
-PARTIAL_VI = (180, 188, 200)   # partial (uncommitted) Vi — dim
-COMMIT_VI = (132, 220, 198)    # committed Vi line — teal/green
-PARTIAL_EN = (200, 200, 200)
-COMMIT_EN = (255, 218, 121)    # committed English — warm yellow
+BG = (24, 26, 31)
+CHROME = (40, 44, 52)
+DIM = (110, 118, 130)
+TEXT = (220, 224, 230)
+PROMPT = (148, 226, 213)
+USER = (240, 240, 240)
+LISTENING = (255, 196, 96)
+PARTIAL_VI = (180, 188, 200)   # partial (uncommitted) Vi — dim grey
+DRAFT_EN = (160, 168, 180)     # in-flight EN draft — even dimmer
+COMMIT_VI = (132, 220, 198)    # committed Vi — teal
+COMMIT_EN = (255, 218, 121)    # committed EN — warm yellow
 STATS = (148, 226, 213)
-WATERMARK = (90, 92, 98)
 
-# Animation timing (15 fps)
 FPS = 15
 FRAMES = []
 
-# Load fonts — DejaVu Sans Mono covers Vietnamese diacritics
+
 def font(size, bold=False):
-    if bold:
-        return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf", size)
-    return ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf", size)
+    # DejaVu Sans Mono has the composed Vietnamese diacritic glyphs (Hack Nerd
+    # Font / Noto Mono don't); we use it for body text. Arrows are rendered
+    # separately via arrow_font() below because DejaVu lacks U+2933 ⤳.
+    path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono"
+    return ImageFont.truetype(f"{path}{'-Bold' if bold else ''}.ttf", size)
+
+
+def arrow_font(size, bold=False):
+    # No common monospace font on Ubuntu has U+2933 ⤳ — checked dejavu/hack/
+    # firacode/noto-mono via fontTools.getBestCmap. Math/serif fonts do; we
+    # use NotoSansMath (clean math arrow) with DejaVu Serif as the fallback.
+    candidates = [
+        "/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf",
+        f"/usr/share/fonts/truetype/dejavu/DejaVuSerif{'-Bold' if bold else ''}.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except OSError:
+            continue
+    return font(size, bold)
+
 
 F_TITLE = font(13)
-F_BODY  = font(18)
+F_BODY = font(18)
 F_BODY_B = font(18, bold=True)
-F_SMALL = font(12)
+F_ARROW = arrow_font(20)
+F_ARROW_B = arrow_font(20, bold=True)
 
-# Content
 VI_1 = "Đây là demo hệ thống dịch nói thời gian thực."
 EN_1 = "This is a real-time speech translation demo."
 VI_2 = "Tất cả chạy trên CPU, không cần internet."
-EN_2 = "Everything runs on the CPU — no internet needed."
+EN_2 = "Everything runs on the CPU, no internet needed."
 
 CMD = "./stream_translate.sh --lang vi-VN --target-lang en-US"
 LOAD_LINES = [
@@ -71,24 +87,16 @@ LOAD_LINES = [
 
 
 def base():
-    """Return a fresh frame with terminal chrome + watermark."""
     img = Image.new("RGB", (W, H), BG)
     d = ImageDraw.Draw(img)
-    # title bar
     d.rectangle([0, 0, W, 28], fill=CHROME)
     d.ellipse([10, 8, 22, 20], fill=(252, 96, 92))
     d.ellipse([28, 8, 40, 20], fill=(254, 188, 46))
     d.ellipse([46, 8, 58, 20], fill=(40, 200, 64))
-    d.text((W // 2 - 80, 6), "nemotron-asr — vi → en", fill=DIM, font=F_TITLE)
-    # corner watermark
-    d.text((W - 96, 6), "MOCKUP", fill=WATERMARK, font=F_TITLE)
+    title = "nemotron-asr-realtime-translate"
+    tw = d.textlength(title, font=F_TITLE)
+    d.text(((W - tw) // 2, 6), title, fill=DIM, font=F_TITLE)
     return img, d
-
-
-def draw_lines(d, lines, x0=20, y0=44, lh=24):
-    """Draw a list of (text, color, font) tuples top-to-bottom."""
-    for i, (text, color, fnt) in enumerate(lines):
-        d.text((x0, y0 + i * lh), text, fill=color, font=fnt)
 
 
 def push(img, n=1):
@@ -101,43 +109,103 @@ def cursor(d, x, y, fnt, on=True):
         d.text((x, y), "▌", fill=TEXT, font=fnt)
 
 
+def render(*, vi_partial="", en_draft="", history=None, show_listen=True, stats=False):
+    """Render one frame.
+
+    history is a list of (vi_committed, en_committed) tuples — scrolled-up
+    utterances. vi_partial / en_draft are the currently-live area, both
+    rendered together (this is the parallel behaviour: ASR partial AND
+    translator draft update concurrently).
+    """
+    img, d = base()
+    d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
+    d.text((44, 44), CMD, fill=USER, font=F_BODY)
+    for j, ll in enumerate(LOAD_LINES):
+        d.text((20, 76 + j * 26), ll, fill=DIM, font=F_BODY)
+    if show_listen:
+        d.text((20, 196), "● Listening  vi-VN → en-US", fill=LISTENING, font=F_BODY_B)
+
+    y = 232
+    for vi_c, en_c in history or []:
+        d.text((20, y), "  vi  ", fill=DIM, font=F_BODY)
+        d.text((76, y), vi_c, fill=COMMIT_VI, font=F_BODY)
+        y += 28
+        d.text((20, y), "    ", fill=DIM, font=F_BODY)
+        d.text((60, y - 2), "↳", fill=DIM, font=F_ARROW)
+        d.text((84, y), en_c, fill=COMMIT_EN, font=F_BODY_B)
+        y += 28
+
+    # Live area: partial Vi + draft EN, both visible simultaneously
+    if vi_partial or en_draft:
+        d.text((20, y), "  vi  ", fill=DIM, font=F_BODY)
+        d.text((76, y), vi_partial + ("▌" if vi_partial else ""), fill=PARTIAL_VI, font=F_BODY)
+        y += 28
+        d.text((20, y), "    ", fill=DIM, font=F_BODY)
+        d.text((60, y - 2), "⤳", fill=DIM, font=F_ARROW)
+        d.text((84, y), en_draft, fill=DRAFT_EN, font=F_BODY)
+        y += 28
+
+    if stats:
+        d.text((20, H - 36),
+               "── streaming  ASR RTF 0.20 · NLLB int8 · vi-VN → en-US · MIT",
+               fill=STATS, font=F_BODY)
+    return img
+
+
+def stream_pair(vi_text, en_text, *, lag=2, history=None, hold_after=8):
+    """Animate vi_text growing word-by-word with en_text trailing by `lag` words.
+
+    Both lines update in the SAME frame — the translator's draft slot is
+    overwritten as new ASR partials arrive, just like the live UI.
+    """
+    vi_words = vi_text.split()
+    en_words = en_text.split()
+    steps = len(vi_words) + lag  # extra steps so EN can catch up after Vi finishes
+    for i in range(1, steps + 1):
+        vi_now = " ".join(vi_words[:min(i, len(vi_words))])
+        # EN draft trails Vi by `lag` words, capped at full EN
+        en_idx = max(0, min(i - lag, len(en_words)))
+        en_now = " ".join(en_words[:en_idx])
+        FRAMES.append(render(vi_partial=vi_now, en_draft=en_now, history=history))
+        FRAMES.append(render(vi_partial=vi_now, en_draft=en_now, history=history))
+    # hold the moment just before commit
+    final = render(vi_partial=vi_text, en_draft=en_text, history=history)
+    push(final, hold_after)
+
+
 def make():
-    # --- 0. empty prompt, cursor blink (1s) ---
+    # 0. empty prompt, cursor blink
     for i in range(FPS):
         img, d = base()
-        line_y = 44
-        d.text((20, line_y), "$ ", fill=PROMPT, font=F_BODY)
-        cursor(d, 44, line_y, F_BODY, on=(i // 4) % 2 == 0)
+        d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
+        cursor(d, 44, 44, F_BODY, on=(i // 4) % 2 == 0)
         FRAMES.append(img)
 
-    # --- 1. type the command (1.5s) ---
+    # 1. type command
     for i in range(1, len(CMD) + 1):
         img, d = base()
         d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
         d.text((44, 44), CMD[:i], fill=USER, font=F_BODY)
         cursor(d, 44 + len(CMD[:i]) * 11, 44, F_BODY)
-        # vary speed: pause briefly at spaces
-        n = 2 if CMD[i - 1] != " " else 3
-        push(img, n)
+        push(img, 2 if CMD[i - 1] != " " else 3)
 
-    # hold full command
     img, d = base()
     d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
     d.text((44, 44), CMD, fill=USER, font=F_BODY)
     push(img, 6)
 
-    # --- 2. loading lines appear one at a time (2s) ---
-    shown_loads = []
+    # 2. loading lines (cumulative)
+    shown = []
     for line in LOAD_LINES:
-        shown_loads.append(line)
+        shown.append(line)
         img, d = base()
         d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
         d.text((44, 44), CMD, fill=USER, font=F_BODY)
-        for j, ll in enumerate(shown_loads):
+        for j, ll in enumerate(shown):
             d.text((20, 76 + j * 26), ll, fill=DIM, font=F_BODY)
         push(img, 6)
 
-    # --- 3. listening indicator (0.5s) ---
+    # 3. listening
     for i in range(8):
         img, d = base()
         d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
@@ -148,95 +216,23 @@ def make():
         d.text((20, 196), f"{blink} Listening  vi-VN → en-US", fill=LISTENING, font=F_BODY_B)
         FRAMES.append(img)
 
-    # --- 4. Vi partial 1 grows letter-by-letter (3s, ~3 chars/frame) ---
-    def render_state(*, vi_partial="", vi_committed=None, en_partial="", en_committed=None, show_listen=True, stats=False):
-        img, d = base()
-        d.text((20, 44), "$ ", fill=PROMPT, font=F_BODY)
-        d.text((44, 44), CMD, fill=USER, font=F_BODY)
-        for j, ll in enumerate(LOAD_LINES):
-            d.text((20, 76 + j * 26), ll, fill=DIM, font=F_BODY)
-        if show_listen:
-            d.text((20, 196), "● Listening  vi-VN → en-US", fill=LISTENING, font=F_BODY_B)
+    # 4. utterance 1 — Vi + EN draft grow in parallel
+    stream_pair(VI_1, EN_1, lag=2, history=[])
 
-        y = 232
-        if vi_committed:
-            for line in vi_committed:
-                d.text((20, y), "  vi  ", fill=DIM, font=F_BODY)
-                d.text((76, y), line, fill=COMMIT_VI, font=F_BODY)
-                y += 28
-        if en_committed:
-            for line in en_committed:
-                d.text((20, y), "  en  ", fill=DIM, font=F_BODY)
-                d.text((76, y), line, fill=COMMIT_EN, font=F_BODY_B)
-                y += 28
-        if vi_partial:
-            d.text((20, y), "  vi  ", fill=DIM, font=F_BODY)
-            d.text((76, y), vi_partial + "▌", fill=PARTIAL_VI, font=F_BODY)
-            y += 28
-        if en_partial:
-            d.text((20, y), "  en  ", fill=DIM, font=F_BODY)
-            d.text((76, y), en_partial + "▌", fill=PARTIAL_EN, font=F_BODY)
-            y += 28
+    # 5. commit utterance 1 — moves into history, live area clears for next
+    history_after_1 = [(VI_1, EN_1)]
+    push(render(history=history_after_1), 4)
 
-        if stats:
-            d.text((20, H - 36), "── streaming  ASR RTF 0.20 · NLLB int8 · CPU/laptop · MIT", fill=STATS, font=F_BODY)
+    # 6. utterance 2 — same parallel growth, with previous as history
+    stream_pair(VI_2, EN_2, lag=2, history=history_after_1)
 
-        return img
-
-    # Vi partial 1 grows in word-chunks (more realistic than letter-by-letter for ASR)
-    vi1_words = VI_1.split()
-    accum = ""
-    for w in vi1_words:
-        accum = (accum + " " + w).strip()
-        FRAMES.append(render_state(vi_partial=accum))
-        FRAMES.append(render_state(vi_partial=accum))
-        FRAMES.append(render_state(vi_partial=accum))
-
-    # commit Vi 1: hold briefly with cursor blink, then commit
-    for _ in range(4):
-        FRAMES.append(render_state(vi_partial=VI_1))
-
-    # En partial 1 grows
-    en1_words = EN_1.split()
-    accum_en = ""
-    for w in en1_words:
-        accum_en = (accum_en + " " + w).strip()
-        FRAMES.append(render_state(vi_committed=[VI_1], en_partial=accum_en))
-        FRAMES.append(render_state(vi_committed=[VI_1], en_partial=accum_en))
-
-    # commit En 1
-    for _ in range(6):
-        FRAMES.append(render_state(vi_committed=[VI_1], en_committed=[EN_1]))
-
-    # Vi partial 2 grows
-    vi2_words = VI_2.split()
-    accum2 = ""
-    for w in vi2_words:
-        accum2 = (accum2 + " " + w).strip()
-        FRAMES.append(render_state(vi_committed=[VI_1], en_committed=[EN_1], vi_partial=accum2))
-        FRAMES.append(render_state(vi_committed=[VI_1], en_committed=[EN_1], vi_partial=accum2))
-        FRAMES.append(render_state(vi_committed=[VI_1], en_committed=[EN_1], vi_partial=accum2))
-
-    for _ in range(4):
-        FRAMES.append(render_state(vi_committed=[VI_1], en_committed=[EN_1], vi_partial=VI_2))
-
-    # En partial 2 grows
-    en2_words = EN_2.split()
-    accum_en2 = ""
-    for w in en2_words:
-        accum_en2 = (accum_en2 + " " + w).strip()
-        FRAMES.append(render_state(vi_committed=[VI_1, VI_2], en_committed=[EN_1], en_partial=accum_en2))
-        FRAMES.append(render_state(vi_committed=[VI_1, VI_2], en_committed=[EN_1], en_partial=accum_en2))
-
-    # commit + stats reveal
-    for _ in range(8):
-        FRAMES.append(render_state(vi_committed=[VI_1, VI_2], en_committed=[EN_1, EN_2]))
-    for _ in range(20):
-        FRAMES.append(render_state(vi_committed=[VI_1, VI_2], en_committed=[EN_1, EN_2], show_listen=False, stats=True))
+    # 7. commit utterance 2 + final stats banner
+    history_after_2 = [(VI_1, EN_1), (VI_2, EN_2)]
+    push(render(history=history_after_2), 6)
+    push(render(history=history_after_2, show_listen=False, stats=True), 22)
 
 
 def encode_gif(frames):
-    """Frames → GIF via ffmpeg+palettegen (universal, no gifski dependency)."""
     if not frames:
         sys.exit("no frames")
     with tempfile.TemporaryDirectory() as td:
