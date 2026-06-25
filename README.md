@@ -1,5 +1,13 @@
 # nemotron-asr-realtime-translate
 
+<!--
+  demo/demo.gif is currently a programmatic mockup rendered by
+  demo/make-mockup.py — it faithfully mirrors stream_translate.py's live UI
+  (parallel ASR partial + translator draft, then commit). Replace it with a
+  real screen recording before any public launch — see demo/README.md.
+-->
+![Demo: Vietnamese speech → English translation, live on a MacBook CPU](demo/demo.gif)
+
 **Real-time speech translation built on Nemotron-3.5 ASR.** Stream audio in
 any of **19 source languages** (English, Vietnamese, Chinese, Spanish, French,
 German, Italian, Portuguese, Japanese, Korean, Arabic, Russian, Thai,
@@ -9,14 +17,6 @@ languages** via NLLB. Runs on a MacBook CPU. No API keys. No cloud.
 **Vi ↔ En ships as the well-tuned foundation example** — custom translator,
 sub-second latency, defaults tuned for tone-language speech — but the same
 pipeline drives any other pair via `--lang` and `--target-lang`.
-
-<!--
-  demo/demo.gif is currently a programmatic mockup rendered by
-  demo/make-mockup.py — it faithfully mirrors stream_translate.py's live UI
-  (parallel ASR partial + translator draft, then commit). Replace it with a
-  real screen recording before any public launch — see demo/README.md.
--->
-![Demo: Vietnamese speech → English translation, live on a MacBook CPU](demo/demo.gif)
 
 ## Stack at a glance
 
