@@ -11,9 +11,9 @@ sub-second latency, defaults tuned for tone-language speech — but the same
 pipeline drives any other pair via `--lang` and `--target-lang`.
 
 <!--
-  Launch-blocker: until you record the demo per demo/README.md and commit
-  demo/demo.gif, the image below renders broken. That's the reminder. Don't
-  remove this block until the GIF exists.
+  demo/demo.gif is currently a MOCKUP rendered by demo/make-mockup.py
+  (watermarked "MOCKUP" in the corner). Replace it with a real screen
+  recording before any public launch — see demo/README.md.
 -->
 ![Demo: Vietnamese speech → English translation, live on a MacBook CPU](demo/demo.gif)
 
