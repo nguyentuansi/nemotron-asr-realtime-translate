@@ -5,6 +5,23 @@ No API keys. No cloud. Runs on a MacBook.
 
 Live Vietnamese audio in → English text out in ~1 second, end-to-end on CPU.
 
+## Stack at a glance
+
+| Layer | Choice | Why |
+|---|---|---|
+| Streaming ASR | **Nemotron-3.5-asr-streaming-0.6b** (NVIDIA, NeMo) | 19 production languages incl. Vietnamese, cache-aware streaming Conformer |
+| ASR runtime | **ONNX Runtime (CPU EP)** | Custom export with cache I/O → 8× faster than PyTorch on CPU (RTF 1.6 → 0.20) |
+| Translation (default) | **EnViT5** (VietAI) via **CTranslate2 int8** | SOTA Vi↔En, OpenRAIL (commercial OK), 3× smaller than NLLB |
+| Translation (alt) | **NLLB-200-distilled-600M** (Meta) via CTranslate2 int8 | 200 languages — use `--translator nllb` |
+| Noise suppression | **GTCRN** via sherpa-onnx (opt-in `--denoise`) | ~40 ms/chunk; feeds the silence VAD without touching ASR audio |
+| Web UI | **FastAPI** + **uvicorn[standard]** + WebSocket | Multi-client browser display of the same pipeline |
+| Audio capture | **alsaaudio** (Linux) / **sounddevice** shim (macOS, Windows) | Native ALSA where available, cross-platform fallback elsewhere |
+| Runtime | **Python 3.13** + **PyTorch 2.12** + **NeMo `@main`** | NeMo pinned to git main for the Nemotron streaming class |
+| First-run setup | `_bootstrap.sh` auto-creates `.venv`, installs from `requirements.txt` | Just `./stream_translate.sh` and it boots |
+| Project license | **MIT** | See [LICENSE](LICENSE); each model has its own license, all are commercial-friendly |
+
+End-to-end: 16 kHz mic → MicProducer (buffered, optional denoise) → 560 ms streaming chunks → ONNX-routed Conformer encoder → RNNT decoder → commit on silence/punctuation/lang-tag → CTranslate2 translator worker → terminal or WebSocket display. ~1 s perceived latency per utterance on M-series CPU.
+
 ## What this is
 
 A small but production-shaped pipeline that wires three open models together:
