@@ -1,18 +1,23 @@
 # nemotron-asr
 
-**Vietnamese-first, locally-running, real-time speech recognition and translation.**
-No API keys. No cloud. Runs on a MacBook.
+**Real-time speech translation built on Nemotron-3.5 ASR.** Stream audio in
+any of **19 source languages** (English, Vietnamese, Chinese, Spanish, French,
+German, Italian, Portuguese, Japanese, Korean, Arabic, Russian, Thai,
+Indonesian, Malay, Hindi, and more) and translate to any of **200 target
+languages** via NLLB. Runs on a MacBook CPU. No API keys. No cloud.
 
-Live Vietnamese audio in → English text out in ~1 second, end-to-end on CPU.
+**Vi ↔ En ships as the well-tuned foundation example** — custom translator,
+sub-second latency, defaults tuned for tone-language speech — but the same
+pipeline drives any other pair via `--lang` and `--target-lang`.
 
 ## Stack at a glance
 
 | Layer | Choice | Why |
 |---|---|---|
-| Streaming ASR | **Nemotron-3.5-asr-streaming-0.6b** (NVIDIA, NeMo) | 19 production languages incl. Vietnamese, cache-aware streaming Conformer |
+| Streaming ASR | **Nemotron-3.5-asr-streaming-0.6b** (NVIDIA, NeMo) | **19 production languages**, cache-aware streaming Conformer with prompt conditioning per language |
 | ASR runtime | **ONNX Runtime (CPU EP)** | Custom export with cache I/O → 8× faster than PyTorch on CPU (RTF 1.6 → 0.20) |
-| Translation (default) | **EnViT5** (VietAI) via **CTranslate2 int8** | SOTA Vi↔En, OpenRAIL (commercial OK), 3× smaller than NLLB |
-| Translation (alt) | **NLLB-200-distilled-600M** (Meta) via CTranslate2 int8 | 200 languages — use `--translator nllb` |
+| Translation (general) | **NLLB-200-distilled-600M** (Meta) via **CTranslate2 int8** | **200 languages** — covers any pair the ASR supports |
+| Translation (Vi↔En showcase) | **EnViT5** (VietAI) via CTranslate2 int8 | SOTA on PhoMT/MTet, OpenRAIL (commercial OK), 3× smaller than NLLB — default for `--lang vi-VN` |
 | Noise suppression | **GTCRN** via sherpa-onnx (opt-in `--denoise`) | ~40 ms/chunk; feeds the silence VAD without touching ASR audio |
 | Web UI | **FastAPI** + **uvicorn[standard]** + WebSocket | Multi-client browser display of the same pipeline |
 | Audio capture | **alsaaudio** (Linux) / **sounddevice** shim (macOS, Windows) | Native ALSA where available, cross-platform fallback elsewhere |
@@ -21,6 +26,27 @@ Live Vietnamese audio in → English text out in ~1 second, end-to-end on CPU.
 | Project license | **MIT** | See [LICENSE](LICENSE); each model has its own license, all are commercial-friendly |
 
 End-to-end: 16 kHz mic → MicProducer (buffered, optional denoise) → 560 ms streaming chunks → ONNX-routed Conformer encoder → RNNT decoder → commit on silence/punctuation/lang-tag → CTranslate2 translator worker → terminal or WebSocket display. ~1 s perceived latency per utterance on M-series CPU.
+
+## Use it with any language pair
+
+```bash
+# Default — Vi → En (the polished example)
+./stream_translate.sh
+
+# Spanish → English
+./stream_translate.sh --lang es-ES --target-lang en-US --translator nllb
+
+# English → Japanese
+./stream_translate.sh --lang en-US --target-lang ja-JP --translator nllb
+
+# Chinese → Vietnamese
+./stream_translate.sh --lang zh-CN --target-lang vi-VN --translator nllb
+
+# Hindi → Arabic (any of 19 source × 200 target combos works)
+./stream_translate.sh --lang hi-IN --target-lang arb_Arab --translator nllb
+```
+
+`--translator nllb` switches to NLLB-200 for non-Vi-En pairs. Source language codes follow Nemotron's prompt dictionary (BCP-47 style); target codes are the NLLB code map in `translator.py:ASR_TO_NLLB` (e.g. `eng_Latn`, `vie_Latn`, `jpn_Jpan`).
 
 ## What this is
 
@@ -40,9 +66,11 @@ Two interfaces ship out of the box:
 
 ## Why it exists
 
-In 2026 most streaming-translation tools are either cloud APIs (Google, OpenAI, Azure — your audio leaves your machine, you need a key, you pay per minute) or English-first open-source demos that treat Vietnamese as an afterthought. There was no good answer for "Vietnamese speech to English text, live, on a laptop, free, source-available."
+In 2026 most streaming-translation tools are either cloud APIs (Google, OpenAI, Azure — your audio leaves your machine, you need a key, you pay per minute) or English-first open-source demos that treat every other language as an afterthought.
 
-This repo is that answer. The defaults are tuned for Vietnamese. The translator was picked specifically because it beats NLLB on Vi↔En quality (per PhoMT/MTet benchmarks). The encoder runs through ONNX Runtime for ~8× speedup so it actually keeps up with real-time on a MacBook CPU.
+This repo is the open answer: **any of Nemotron's 19 source languages → any of NLLB's 200 targets**, live, on a laptop, free, source-available. The encoder runs through ONNX Runtime for ~8× speedup so it actually keeps up with real-time on a MacBook CPU; CTranslate2 int8 keeps translation under 200 ms per utterance.
+
+**The Vi↔En path is the polished showcase** because that's the niche the project was anchored to — defaults are tuned for tone-language speech, the EnViT5 translator was picked specifically because it beats NLLB on Vi↔En per PhoMT/MTet benchmarks, and the silence/punctuation commit logic was tested against Vietnamese sentence patterns. Other language pairs work today via the NLLB backend; treat them as well-supported but less custom-tuned. PRs improving any other pair are welcome.
 
 ## Quick start
 
@@ -82,14 +110,14 @@ Same pipeline, different display. Useful for screen-sharing, captioning meetings
 
 ## Features
 
+- **Wide language coverage** — 19 source ASR languages × 200 NLLB target languages = thousands of pairs, all swappable with two CLI flags
+- **Bidirectional Vi ↔ En specialist** built in (~275 M params int8 EnViT5) as the polished foundation example; specialist translators for other pairs can be added via `make_translator` in `translator.py`
 - **Streaming, not batched** — partial transcripts appear chunk-by-chunk (560 ms cadence), commits land on natural sentence boundaries
-- **Bidirectional Vi ↔ En translation** with a single small model (~275 M params, int8)
 - **CPU-real-time** on Apple Silicon via ONNX Runtime (encoder exported with cache-state I/O, ~8× speedup over PyTorch)
 - **Drop-in CUDA support** — if `torch.cuda.is_available()`, the ASR runs on GPU automatically
 - **Cross-platform mic capture** — native ALSA on Linux, `sounddevice` shim everywhere else (`alsa_shim.py`)
 - **Session recording + structured logs** — every run writes `logs/audio-<ts>.wav` (raw mic) + `logs/stream-<ts>.log` (per-chunk debug) for offline replay
 - **Backwards-compatible flags** — every default in this README is overridable from the CLI
-- **20+ language support** via the `--translator nllb` backend when you need more than Vi↔En
 
 ## Architecture
 
@@ -123,7 +151,7 @@ Same pipeline, different display. Useful for screen-sharing, captioning meetings
   │   - end-of-utterance <lang> tag              │
   │   - sentence-final punctuation               │
   └─────────────────────────────────────────────┘
-      │ committed Vietnamese text
+      │ committed source-language text
       ▼
   ┌─────────────────────────────────────────────┐
   │ Translator worker (background thread)        │
