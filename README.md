@@ -230,6 +230,7 @@ nemotron-asr-realtime-translate/
 ├── mic_to_asr_test.sh    record N seconds, transcribe, print result
 ├── audio/                bundled LibriSpeech samples + your bench wavs
 ├── bench/                RTF / WER measurement scripts + saved results
+├── scripts/              dev/legacy: earlier stream_demo, mic test, diag tools
 ├── docs/
 │   ├── training/         Vietnamese fine-tuning workflow (5 chapters)
 │   └── performance/      ONNX + INT8 + CoreML perf workflow (5 chapters)
