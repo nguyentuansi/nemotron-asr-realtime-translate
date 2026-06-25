@@ -1,0 +1,10 @@
+# Raw recordings — large, regenerable, don't ship in the repo
+raw.mp4
+raw.mov
+raw.mkv
+raw.webm
+
+# Frame dumps used by make-gif.sh
+frames/
+frame-*.png
+*.tmp.png

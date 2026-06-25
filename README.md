@@ -10,6 +10,13 @@ languages** via NLLB. Runs on a MacBook CPU. No API keys. No cloud.
 sub-second latency, defaults tuned for tone-language speech — but the same
 pipeline drives any other pair via `--lang` and `--target-lang`.
 
+<!--
+  Launch-blocker: until you record the demo per demo/README.md and commit
+  demo/demo.gif, the image below renders broken. That's the reminder. Don't
+  remove this block until the GIF exists.
+-->
+![Demo: Vietnamese speech → English translation, live on a MacBook CPU](demo/demo.gif)
+
 ## Stack at a glance
 
 | Layer | Choice | Why |
@@ -231,6 +238,7 @@ nemotron-asr-realtime-translate/
 ├── audio/                bundled LibriSpeech samples + your bench wavs
 ├── bench/                RTF / WER measurement scripts + saved results
 ├── scripts/              dev/legacy: earlier stream_demo, mic test, diag tools
+├── demo/                 recording protocol + Vi script + mp4→gif helper
 ├── docs/
 │   ├── training/         Vietnamese fine-tuning workflow (5 chapters)
 │   └── performance/      ONNX + INT8 + CoreML perf workflow (5 chapters)
