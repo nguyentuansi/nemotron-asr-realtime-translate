@@ -8,3 +8,6 @@ raw.webm
 frames/
 frame-*.png
 *.tmp.png
+
+# Ephemeral output of simulate.py — regenerated on every run
+simulated-output.txt

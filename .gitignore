@@ -12,6 +12,10 @@ audio/_mic_trim_amp.wav
 audio/_mic_manifest.json
 audio/_diag_*.json
 audio/smoke_manifest.json
+audio/_sim_manifest.json
+
+# Piper-synthesized Vi audio for demo/simulate.py — regenerable from demo/README.md
+audio/demo_vi.wav
 
 .claude/
 

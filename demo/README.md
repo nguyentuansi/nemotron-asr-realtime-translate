@@ -4,6 +4,9 @@ The README's hero image is `demo/demo.gif`. Until you record it the image link
 is broken — that's intentional, it's the reminder to ship the demo before
 launching.
 
+For a fast no-mic sanity check that the pipeline still runs, see
+[**Test without a mic**](#test-without-a-mic) at the bottom.
+
 ## What good looks like
 
 - **25–35 seconds.** Long enough to show a couple of utterances, short enough
@@ -80,3 +83,31 @@ ls -lh demo/demo.gif       # under 8 MB, ideally under 5 MB
 file demo/demo.gif         # should say "GIF image data"
 git diff --stat HEAD~1     # no surprise files
 ```
+
+## Test without a mic
+
+`simulate.py` runs the same models the live UI loads (Nemotron ASR +
+NLLB-200) against a WAV file. Useful for verifying the pipeline is wired
+end-to-end before you start recording.
+
+```bash
+# 1. (optional) synthesize Vietnamese audio with Piper neural TTS
+.venv/bin/python -m pip install piper-tts
+curl -fSL -o /tmp/piper-vi.onnx \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium.onnx
+curl -fSL -o /tmp/piper-vi.onnx.json \
+  https://huggingface.co/rhasspy/piper-voices/resolve/main/vi/vi_VN/vais1000/medium/vi_VN-vais1000-medium.onnx.json
+echo "Hệ thống dịch tự động chạy trên máy tính, không cần kết nối mạng." \
+  | .venv/bin/python -m piper -m /tmp/piper-vi.onnx -f /tmp/vi.wav
+ffmpeg -y -i /tmp/vi.wav -ar 16000 -ac 1 audio/demo_vi.wav -loglevel error
+
+# 2. transcribe + translate end-to-end
+.venv/bin/python demo/simulate.py
+```
+
+`sample-output.txt` in this directory is a captured run for reference. It
+also documents a useful caveat: TTS pronounces English loanwords ("CPU",
+"MacBook", "API key", etc.) as Vietnamese phonemes, so the simulated
+transcript will look noisy where the script contains those words. A real
+human speaker code-switches them correctly. **TTS proves the pipeline
+works; it can't replace the real recording.**

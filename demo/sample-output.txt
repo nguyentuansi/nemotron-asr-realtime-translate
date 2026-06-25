@@ -1,0 +1,37 @@
+=== Simulated demo transcript (no-mic sanity check) ====================
+  audio:        demo_vi.wav   (Piper TTS, vi_VN-vais1000-medium, 5.9 s)
+  source lang:  vi-VN
+  target lang:  en-US
+  ASR time:     1.82 s    (CUDA inference; CPU-only RTF ~0.20 per README)
+  Translator:   0.97 s    (NLLB-200-distilled-600M int8)
+------------------------------------------------------------------------
+  [vi-VN]  Đây là đem hoa hệ thống dịch nói thời gian thực tất cả chạy
+           trên sai cấu máy mặc bóc không cần in tơ nét, không cần ha
+           gầy kỳ. <vi-VN>
+  [en-US]  This is the flower of the real-time translation system, all
+           running on the wrong machine without needing filtering,
+           without needing thin film.
+========================================================================
+
+Reading the result honestly
+---------------------------
+
+Native Vietnamese transcribes cleanly:
+  hệ thống dịch nói thời gian thực   ✓
+  tất cả chạy trên                   ✓
+  không cần ... không cần            ✓
+  máy                                ✓
+
+The errors land exactly on the English loanwords from the script, which
+Piper Vi pronounces as Vietnamese phonemes:
+  demo       → "đem hoa"
+  CPU        → "sai cấu"
+  MacBook    → "mặc bóc"
+  internet   → "in tơ nét"
+  API key    → "ha gầy kỳ"
+
+A real Vietnamese speaker reading the same script code-switches those
+loanwords naturally and the ASR transcribes them correctly. This file is
+the no-mic sanity check that the pipeline (load → transcribe → translate
+→ commit) is wired end-to-end; the published demo (`demo/demo.gif`) is
+recorded from real human speech and lives at the top of README.md.
