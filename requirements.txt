@@ -1,0 +1,50 @@
+# Python 3.11 recommended. Rebuild the venv with:
+#   python3.11 -m venv .venv && source .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# On Linux with CUDA, install torch first from the cu124 index, e.g.:
+#   pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu124
+# On macOS, plain `pip install torch torchaudio` gives a CPU/MPS build.
+
+# Core ASR
+#   IMPORTANT: nemo_toolkit must come from NVIDIA/NeMo @main, not PyPI.
+#   The Nemotron-3.5 streaming ASR model references
+#   nemo.collections.asr.models.rnnt_bpe_models_prompt.EncDecRNNTBPEModelWithPrompt
+#   which is only present on main; the latest PyPI wheel (2.7.3 as of 2026-06)
+#   does NOT include it. See the model card on HuggingFace.
+#   System deps needed first: brew install libsndfile ffmpeg  (macOS)
+#                          apt-get install libsndfile1 ffmpeg  (linux)
+Cython
+packaging
+torch
+torchaudio
+nemo_toolkit[asr] @ git+https://github.com/NVIDIA/NeMo.git@main
+soundfile
+numpy
+
+# Translation (stream_translate.py / stream_web.py)
+transformers
+ctranslate2
+
+# Web UI (stream_web.py). uvicorn[standard] pulls in websockets + uvloop +
+# httptools — needed for the WebSocket transport stream_web.py uses; without
+# them you get "No supported WebSocket library detected" at every client connect.
+fastapi
+uvicorn[standard]
+
+# Mic capture
+#   - On Linux we prefer pyalsaaudio (native ALSA, lowest latency).
+#   - Elsewhere the scripts fall back to alsa_shim.py, which wraps sounddevice
+#     (PortAudio) and exposes the same API. sounddevice also works on Linux
+#     as a backup if pyalsaaudio fails to build.
+pyalsaaudio; sys_platform == "linux"
+sounddevice
+
+# Real-time noise suppression (--denoise). sherpa-onnx ships Apache-2.0,
+# Python 3.13 wheels, and the GTCRN streaming denoiser. Model file
+# (gtcrn_simple.onnx, ~520 KB) auto-downloads on first --denoise run.
+sherpa-onnx
+
+# ONNX encoder optimization (CPU-EP, ~8x speedup over PyTorch).
+onnxruntime
+onnxscript

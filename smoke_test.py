@@ -1,5 +1,5 @@
 """Smoke test: load nvidia/nemotron-3.5-asr-streaming-0.6b and transcribe two clips."""
-import os, sys, time, traceback
+import os, sys, time, traceback, logging
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -8,6 +8,9 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 # Help with fragmentation on the 6GB RTX 2060.
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+if os.environ.get("NEMO_VERBOSE") != "1":
+    logging.getLogger("nemo_logger").setLevel(logging.WARNING)
+    logging.getLogger("nv_one_logger").setLevel(logging.ERROR)
 
 import torch
 print(f"[env] torch={torch.__version__} cuda={torch.cuda.is_available()} "

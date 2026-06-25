@@ -59,8 +59,18 @@ os.environ.setdefault("HF_HOME", str(HERE / ".hf-cache"))
 os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# Quiet NeMo's INFO chatter — the same RNNT-loss/CUDA warnings re-fire 3x per
+# submodule during construction. Set NEMO_VERBOSE=1 to restore.
+if os.environ.get("NEMO_VERBOSE") != "1":
+    logging.getLogger("nemo_logger").setLevel(logging.WARNING)
+    # OneLogger (NVIDIA telemetry) prints two banner lines at NeMo import time.
+    # Suppressing the nv_one_logger parent silences both child loggers.
+    logging.getLogger("nv_one_logger").setLevel(logging.ERROR)
 
-import alsaaudio
+try:
+    import alsaaudio
+except ImportError:
+    import alsa_shim as alsaaudio
 import numpy as np
 import torch
 
@@ -78,39 +88,96 @@ ATT_CONTEXT = {
 
 LANG_TAG_RE = re.compile(r"<[a-zA-Z]{2,3}(?:-[A-Z]{2})?>")
 NLLB_MODEL_DIR = HERE / "nllb-200-distilled-600M-ct2-int8"
+ENVIT5_MODEL_DIR = HERE / "envit5-translation-ct2-int8"
+TRANSLATOR_MODEL_DIRS = {"nllb": NLLB_MODEL_DIR, "envit5": ENVIT5_MODEL_DIR}
 
 
 def load_asr():
     import nemo.collections.asr as nemo_asr
+    if os.environ.get("NEMO_VERBOSE") != "1":
+        # NeMo has its own Logger that ignores stdlib logging filters; use its API.
+        # ERROR (not WARNING) because the no-op label_looping_base CUDA-graphs
+        # warning re-fires once per decoder submodule (3x) on CPU. Set
+        # NEMO_VERBOSE=1 to restore full chatter.
+        from nemo.utils import logging as nemo_logging
+        nemo_logging.setLevel(logging.ERROR)
+    # Device selection: CUDA > CPU. MPS is opt-in via USE_MPS=1 and known to
+    # produce empty hypotheses on the streaming path with this model (the
+    # full-file transcribe() API works on MPS, but conformer_stream_step()
+    # silently outputs zero tokens — likely a broken op in the RNNT predictor's
+    # LSTM or causal conv on MPS). FORCE_CPU=1 disables CUDA too.
+    force_cpu = os.environ.get("FORCE_CPU") == "1"
+    use_cuda = torch.cuda.is_available() and not force_cpu
+    use_mps = (os.environ.get("USE_MPS") == "1" and not use_cuda and not force_cpu
+               and getattr(torch.backends, "mps", None) is not None
+               and torch.backends.mps.is_available())
+    if use_mps:
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        print("[asr]  WARNING: USE_MPS=1 set — streaming may produce empty output, opt-in at your risk",
+              flush=True)
+    target_device = "cuda" if use_cuda else ("mps" if use_mps else "cpu")
+    dev_label = (torch.cuda.get_device_name(0) if use_cuda
+                 else "Apple Silicon (MPS)" if use_mps else "cpu")
     print(f"[env] torch={torch.__version__} cuda={torch.cuda.is_available()} "
-          f"device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'cpu'}",
-          flush=True)
+          f"device={dev_label}", flush=True)
     t0 = time.time()
     model = nemo_asr.models.ASRModel.from_pretrained(
         model_name="nvidia/nemotron-3.5-asr-streaming-0.6b",
         map_location="cpu",
     )
     print(f"[asr]  loaded in {time.time()-t0:.1f}s", flush=True)
-    if torch.cuda.is_available() and os.environ.get("FORCE_CPU") != "1":
+    if use_cuda:
         torch.cuda.empty_cache()
         model = model.to("cuda").eval()
         print(f"[asr]  fp32 weights on GPU: {torch.cuda.memory_allocated()/1e9:.2f} GB",
               flush=True)
+    elif use_mps:
+        try:
+            model = model.to("mps").eval()
+            print("[asr]  running on MPS (Apple Silicon)", flush=True)
+        except Exception as e:
+            print(f"[asr]  MPS failed ({e}); falling back to CPU", flush=True)
+            model = model.to("cpu").eval()
     else:
         model = model.eval()
         print("[asr]  running on CPU", flush=True)
+
+    # Optional: route encoder forward through ONNX Runtime for ~8x CPU speedup.
+    # Gate on the file's existence + NO_ONNX=1 escape hatch. Only on CPU
+    # (CUDA path is already fast enough that the numpy round-trip isn't worth it).
+    onnx_path = HERE / "models" / "encoder.onnx"
+    if (not use_cuda and not use_mps
+            and onnx_path.exists()
+            and os.environ.get("NO_ONNX") != "1"):
+        try:
+            from onnx_encoder import wrap_encoder_with_onnx, pick_providers
+            providers = pick_providers()
+            wrap_encoder_with_onnx(model, onnx_path, providers=providers)
+            real_providers = model.encoder.providers_used
+            print(f"[asr]  encoder routed through ONNX ({onnx_path.name}, providers={real_providers})",
+                  flush=True)
+        except Exception as e:
+            print(f"[asr]  ONNX wrap failed ({type(e).__name__}: {e}); using PyTorch encoder",
+                  flush=True)
     return model
 
 
 class MicProducer(threading.Thread):
-    def __init__(self, device):
+    def __init__(self, device, max_buffer_samples=0, record_path=None, denoiser=None):
         super().__init__(daemon=True)
         self.device = device
+        self.max_buffer_samples = max_buffer_samples
+        # Recording captures RAW mic input (pre-denoise) so you can debug what
+        # the mic actually heard. The ASR path sees the denoised audio.
+        self.record_path = record_path
+        self.denoiser = denoiser  # DenoiseStream or None
+        self._wav = None
         self._lock = threading.Lock()
         self._buf = np.zeros(0, dtype=np.float32)
         self._stop = threading.Event()
         self._error = None
         self._recent_peak = 0.0
+        self._dropped_total = 0
 
     def run(self):
         try:
@@ -122,18 +189,54 @@ class MicProducer(threading.Thread):
         except alsaaudio.ALSAAudioError as e:
             self._error = e
             return
+        if self.record_path is not None:
+            try:
+                import soundfile as sf
+                self.record_path.parent.mkdir(parents=True, exist_ok=True)
+                self._wav = sf.SoundFile(str(self.record_path), mode="w",
+                                         samplerate=SR, channels=CH, subtype="PCM_16")
+            except Exception as e:
+                LOG.warning("session recording disabled: %s", e)
+                self._wav = None
         try:
             while not self._stop.is_set():
                 length, data = pcm.read()
                 if length <= 0:
                     continue
                 arr = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                if self._wav is not None:
+                    try:
+                        self._wav.write(arr)  # RAW (pre-denoise) for replay
+                    except Exception as e:
+                        LOG.warning("session recording stopped: %s", e)
+                        self._wav = None
+                # We send RAW audio to the ASR (Nemotron is noise-robust, and
+                # GTCRN can damage Vietnamese tone phonemes when over-aggressive
+                # — observed on real sessions). The denoiser is used ONLY to
+                # compute a clean peak signal that the silence-VAD can rely on
+                # in a noisy room.
+                p = float(np.abs(arr).max()) if arr.size else 0.0
+                if self.denoiser is not None:
+                    denoised = self.denoiser.process(arr)
+                    if denoised.size > 0:
+                        p = float(np.abs(denoised).max())
+                    # else: denoiser still buffering, keep raw peak this chunk
                 with self._lock:
                     self._buf = np.concatenate([self._buf, arr])
-                    p = float(np.abs(arr).max()) if arr.size else 0.0
+                    if self.max_buffer_samples and self._buf.size > self.max_buffer_samples:
+                        drop = self._buf.size - self.max_buffer_samples
+                        self._buf = self._buf[drop:]
+                        self._dropped_total += drop
                     self._recent_peak = max(p, self._recent_peak * 0.85)
         finally:
             pcm.close()
+            if self._wav is not None:
+                try: self._wav.close()
+                except Exception: pass
+
+    def dropped_samples(self):
+        with self._lock:
+            return self._dropped_total
 
     def take(self, n):
         with self._lock:
@@ -286,10 +389,12 @@ class Translator:
     behind speculative work.
     """
     def __init__(self, model_dir, src_lang, tgt_lang, display, device="cpu",
-                 compute_type="int8", beam_size=2):
-        from translator import NLLBTranslator
-        self.model = NLLBTranslator(
-            model_dir, device=device, compute_type=compute_type, beam_size=beam_size,
+                 compute_type="int8", beam_size=2, backend="nllb"):
+        from translator import make_translator
+        self.backend = backend
+        self.model = make_translator(
+            backend, model_dir,
+            device=device, compute_type=compute_type, beam_size=beam_size,
         )
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
@@ -373,52 +478,87 @@ def main():
                     help="streaming chunk size")
     ap.add_argument("--no-translate", action="store_true",
                     help="run ASR only; do not load the translation model")
+    ap.add_argument("--translator", choices=list(TRANSLATOR_MODEL_DIRS), default="envit5",
+                    help="translation backend: 'envit5' (default; vi<->en only, OpenRAIL, "
+                         "smaller + stronger on Vietnamese) or 'nllb' (20+ langs, MIT)")
     ap.add_argument("--translator-device", choices=["cpu", "cuda"], default="cpu",
-                    help="device for the NLLB translator (default: cpu; keeps GPU for ASR)")
+                    help="device for the translator (default: cpu; keeps GPU for ASR)")
     ap.add_argument("--watchdog", type=int, default=25,
                     help="commit + reset RNNT after N chunks with no new tokens (0=off)")
-    ap.add_argument("--max-utterance-secs", type=float, default=12.0,
-                    help="hard ceiling — force a commit when the current utterance has been "
-                         "running for more than N seconds (don't go below ~10s or you fragment "
-                         "natural Vietnamese reading)")
+    ap.add_argument("--max-utterance-secs", type=float, default=0.0,
+                    help="last-resort fallback: force a commit when the current utterance "
+                         "exceeds N seconds. Disabled by default — natural triggers (silence "
+                         "VAD, end-of-utterance <lang> tag, sentence-final punctuation) handle "
+                         "the common case. Set to a positive number (e.g. 12-30) if you want "
+                         "a hard ceiling against runaway utterances in very noisy environments.")
     ap.add_argument("--max-utterance-chars", type=int, default=240,
                     help="hard cap on running-partial length before a forced commit")
-    ap.add_argument("--silence-secs", type=float, default=2.0,
+    ap.add_argument("--silence-secs", type=float, default=1.5,
                     help="commit when mic audio stays below --silence-threshold for this long. "
-                         "Default 2s is conservative on purpose: a 1s gap is just a Vietnamese "
-                         "phrasing pause, not an utterance end. 0 to disable.")
-    ap.add_argument("--silence-threshold", type=float, default=0.025,
-                    help="audio peak below this counts as silence (linear, 0..1)")
+                         "Default 1.5s tolerates natural micro-pauses (counting, lists) without "
+                         "fragmenting them. Lower to 0.6-0.8 for snappier commits on dictation; "
+                         "raise to 2.5+ for read-aloud paragraphs.")
+    ap.add_argument("--silence-threshold", type=float, default=0.15,
+                    help="audio peak below this counts as silence (linear, 0..1). Default 0.15 "
+                         "tolerates normal room/laptop-fan noise. Lower (0.05) if your mic is "
+                         "very quiet, raise (0.25) if you're in a noisy environment.")
+    ap.add_argument("--max-buffer-secs", type=float, default=1.5,
+                    help="cap unprocessed mic audio at N seconds. If the ASR is slower than "
+                         "real-time (CPU on M-series, RTF~1.5), audio piles up and the "
+                         "displayed transcript falls minutes behind. Capping drops oldest "
+                         "audio when backlog exceeds the cap — trades dropped speech for "
+                         "low latency. 0 disables (old behavior, lag grows unbounded).")
     ap.add_argument("--draft-secs", type=float, default=1.0,
                     help="re-translate the live partial as a draft every N seconds while you "
                          "keep speaking, so a translation is visible BEFORE you pause. "
                          "0 to disable streaming drafts.")
-    ap.add_argument("--full-reset-after", type=int, default=4,
+    ap.add_argument("--full-reset-after", type=int, default=0,
                     help="full ASR state reset (encoder caches + RNNT + audio buffer) after "
-                         "N commits. Prevents the RNNT decoder getting stuck after accumulating "
-                         "many <lang> end-of-utterance tags in its running hypothesis. "
-                         "0 = never (will eventually freeze).")
-    ap.add_argument("--full-reset-secs", type=float, default=45.0,
-                    help="periodic full ASR state reset every N seconds, whichever fires first "
-                         "vs --full-reset-after. 0 = never.")
+                         "N commits. Originally added to dodge a 'RNNT gets stuck after 3-4 "
+                         "<lang> tags' bug on older NeMo builds. On the current NeMo @main + "
+                         "the ONNX-wrapped encoder, the reset itself can break recognition "
+                         "(model emits zero tokens after reset). Disabled by default. Set to "
+                         "4-8 if you actually hit the stuck-RNNT symptom.")
+    ap.add_argument("--full-reset-secs", type=float, default=0.0,
+                    help="periodic full ASR state reset every N seconds. Same caveat as "
+                         "--full-reset-after. 0 = never.")
     ap.add_argument("--render-hz", type=float, default=10.0,
                     help="live partial redraw rate (lower = less terminal flicker)")
     ap.add_argument("--beam-size", type=int, default=2,
                     help="NLLB decoding beam size (1=greedy, 4=quality, 2=balanced)")
     ap.add_argument("--log-file", default="auto",
                     help="path to debug log file, 'auto' for logs/stream-<ts>.log, '-' to disable")
+    ap.add_argument("--record-audio", default="auto",
+                    help="record the full mic session to a wav for offline replay/debug. "
+                         "'auto' -> logs/audio-<ts>.wav alongside the log file, '-' to disable, "
+                         "or pass a path. Recording always captures RAW (pre-denoise) audio so "
+                         "you can hear what the mic actually picked up.")
+    ap.add_argument("--denoise", action="store_true",
+                    help="run GTCRN (sherpa-onnx) to give the silence VAD a clean peak signal "
+                         "in noisy rooms — pauses commit properly even with fan/AC/hum. The "
+                         "ASR still sees RAW audio so Vietnamese tones aren't damaged by the "
+                         "denoiser. ~40ms overhead per 560ms chunk on M-series CPU. "
+                         "Model auto-downloads to models/gtcrn_simple.onnx on first use.")
     args = ap.parse_args()
 
+    ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     if args.log_file == "-":
         log_path = None
     elif args.log_file == "auto":
-        ts = _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
         log_path = HERE / "logs" / f"stream-{ts}.log"
     else:
         log_path = Path(args.log_file)
+    if args.record_audio == "-":
+        audio_path = None
+    elif args.record_audio == "auto":
+        audio_path = HERE / "logs" / f"audio-{ts}.wav"
+    else:
+        audio_path = Path(args.record_audio)
     setup_logging(log_path)
     if log_path is not None:
         print(f"[log]    debug log -> {log_path}", flush=True)
+    if audio_path is not None:
+        print(f"[rec]    session audio -> {audio_path}", flush=True)
         LOG.info("=== session start: %s", " ".join(sys.argv))
 
     att_ctx = ATT_CONTEXT[args.chunk]
@@ -454,14 +594,16 @@ def main():
     if not args.no_translate:
         t0 = time.time()
         translator = Translator(
-            NLLB_MODEL_DIR, args.lang, args.target_lang, display,
+            TRANSLATOR_MODEL_DIRS[args.translator],
+            args.lang, args.target_lang, display,
             device=args.translator_device, beam_size=args.beam_size,
+            backend=args.translator,
         )
         translator.start()
-        print(f"[nmt]  NLLB-200 int8 loaded in {time.time()-t0:.1f}s "
+        print(f"[nmt]  {args.translator} int8 loaded in {time.time()-t0:.1f}s "
               f"on {args.translator_device} beam_size={args.beam_size}", flush=True)
-        LOG.info("translator loaded device=%s beam_size=%d",
-                 args.translator_device, args.beam_size)
+        LOG.info("translator=%s device=%s beam_size=%d",
+                 args.translator, args.translator_device, args.beam_size)
 
     print(f"\n[stream] src={args.lang} -> tgt={args.target_lang} chunk={args.chunk} "
           f"device={args.device}", flush=True)
@@ -472,7 +614,28 @@ def main():
               flush=True)
     print("[*] speak — Ctrl-C to stop\n", flush=True)
 
-    producer = MicProducer(args.device)
+    denoiser = None
+    if args.denoise:
+        gtcrn_path = HERE / "models" / "gtcrn_simple.onnx"
+        if not gtcrn_path.exists():
+            print(f"[denoise] downloading GTCRN model (520 KB)...", flush=True)
+            import urllib.request
+            url = ("https://github.com/k2-fsa/sherpa-onnx/releases/download/"
+                   "speech-enhancement-models/gtcrn_simple.onnx")
+            gtcrn_path.parent.mkdir(parents=True, exist_ok=True)
+            urllib.request.urlretrieve(url, str(gtcrn_path))
+        from denoiser import DenoiseStream
+        denoiser = DenoiseStream(gtcrn_path)
+        print(f"[denoise] GTCRN active ({gtcrn_path.name}, ~40ms/chunk overhead)", flush=True)
+
+    producer = MicProducer(args.device,
+                           max_buffer_samples=int(args.max_buffer_secs * SR),
+                           record_path=audio_path,
+                           denoiser=denoiser)
+    if args.max_buffer_secs > 0:
+        print(f"[cfg]    mic buffer cap: {args.max_buffer_secs}s "
+              f"({int(args.max_buffer_secs * SR)} samples) — older audio dropped "
+              f"when ASR falls behind", flush=True)
     producer.start()
     time.sleep(0.05)
 
@@ -657,9 +820,10 @@ def main():
                     chunks_since_change += 1
 
                 LOG.debug(
-                    "step=%d t=%.2fs peak=%.3f silc=%d raw_len=%d committed=%d new=%r",
+                    "step=%d t=%.2fs peak=%.3f silc=%d raw_len=%d committed=%d new=%r drop_s=%.1f",
                     step, time.time() - t_start, producer.peak(),
                     chunks_below_silence, len(raw_text), committed_raw_len, new_clean[:80],
+                    producer.dropped_samples() / SR,
                 )
 
                 # Track silence chunks (audio-level VAD).
@@ -673,11 +837,24 @@ def main():
                 stripped = new_raw.rstrip()
                 tags = LANG_TAG_RE.findall(stripped)
                 if tags and stripped.endswith(tags[-1]):
-                    commit_utterance(raw_text, reason="lang_tag")
-                    chunks_below_silence = 0
-                    if maybe_full_reset():
-                        break
-                    continue
+                    # The model occasionally emits <lang> tags mid-syllable on
+                    # Vietnamese ("ch<vi-VN>" then "ào" next chunk → "ch" and
+                    # "ào" become separate commits). Only honor the tag as a
+                    # commit signal if the text immediately before it ends at
+                    # a word boundary (space/punctuation). Otherwise the tag
+                    # is premature — let the next chunk extend the word. The
+                    # watchdog (--watchdog N chunks) catches truly stuck states.
+                    text_before_tag = stripped[:-len(tags[-1])]
+                    at_boundary = (not text_before_tag
+                                   or text_before_tag[-1] in " \t\n.,;:!?…" + SENTENCE_END)
+                    if at_boundary:
+                        commit_utterance(raw_text, reason="lang_tag")
+                        chunks_below_silence = 0
+                        if maybe_full_reset():
+                            break
+                        continue
+                    LOG.debug("lang_tag suppressed: mid-word, last char=%r",
+                              text_before_tag[-1] if text_before_tag else "")
                 # Sentence-final punctuation.
                 if new_clean and new_clean[-1] in SENTENCE_END:
                     commit_utterance(raw_text, reason="punctuation")
@@ -745,6 +922,10 @@ def main():
             sys.stdout.flush()
             translator.shutdown(drain_timeout=15.0)
         sys.stdout.write("[done]\n")
+        if audio_path is not None and audio_path.exists():
+            sys.stdout.write(f"[rec]    session audio saved: {audio_path}\n")
+        if log_path is not None:
+            sys.stdout.write(f"[log]    session log:    {log_path}\n")
         sys.stdout.flush()
         LOG.info("=== session end")
     finally:

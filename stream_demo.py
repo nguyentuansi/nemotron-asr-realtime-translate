@@ -25,7 +25,10 @@ os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
 os.environ.setdefault("TRANSFORMERS_NO_ADVISORY_WARNINGS", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-import alsaaudio
+try:
+    import alsaaudio
+except ImportError:
+    import alsa_shim as alsaaudio
 import numpy as np
 import torch
 

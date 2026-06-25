@@ -25,7 +25,10 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import soundfile as sf
-import alsaaudio
+try:
+    import alsaaudio
+except ImportError:
+    import alsa_shim as alsaaudio
 import torch
 
 SR = 16000

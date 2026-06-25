@@ -1,37 +1,231 @@
 # nemotron-asr
 
-Local sandbox for [nvidia/nemotron-3.5-asr-streaming-0.6b](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) — multilingual cache-aware streaming ASR (40 languages, 19 production-ready including Vietnamese).
+**Vietnamese-first, locally-running, real-time speech recognition and translation.**
+No API keys. No cloud. Runs on a MacBook.
 
-## Layout
+Live Vietnamese audio in → English text out in ~1 second, end-to-end on CPU.
+
+## What this is
+
+A small but production-shaped pipeline that wires three open models together:
+
+| Stage | Model | License |
+|---|---|---|
+| Streaming ASR | [`nvidia/nemotron-3.5-asr-streaming-0.6b`](https://huggingface.co/nvidia/nemotron-3.5-asr-streaming-0.6b) — cache-aware Conformer, 19 production languages incl. Vietnamese | NVIDIA Open Model (commercial OK) |
+| Translation (default) | [`VietAI/envit5-translation`](https://huggingface.co/VietAI/envit5-translation) — T5 specialized on Vi↔En via PhoMT/MTet | OpenRAIL-M (commercial OK) |
+| Translation (alternate) | [`facebook/nllb-200-distilled-600M`](https://huggingface.co/facebook/nllb-200-distilled-600M) — 200 languages | MIT |
+| Noise suppression (optional) | [GTCRN](https://github.com/Xiaobin-Rong/gtcrn) via sherpa-onnx | MIT / Apache-2.0 |
+
+Two interfaces ship out of the box:
+
+- **`./stream_translate.sh`** — terminal UI: live partial as you speak, finalized lines with translation under each.
+- **`./stream_web.sh`** — FastAPI + WebSocket UI in the browser, same pipeline, multiple clients can watch the same session.
+
+## Why it exists
+
+In 2026 most streaming-translation tools are either cloud APIs (Google, OpenAI, Azure — your audio leaves your machine, you need a key, you pay per minute) or English-first open-source demos that treat Vietnamese as an afterthought. There was no good answer for "Vietnamese speech to English text, live, on a laptop, free, source-available."
+
+This repo is that answer. The defaults are tuned for Vietnamese. The translator was picked specifically because it beats NLLB on Vi↔En quality (per PhoMT/MTet benchmarks). The encoder runs through ONNX Runtime for ~8× speedup so it actually keeps up with real-time on a MacBook CPU.
+
+## Quick start
+
+```bash
+git clone <this repo>
+cd nemotron-asr
+./stream_translate.sh
+```
+
+That's it. First run does ~10 minutes of one-time setup:
+
+1. Auto-creates a Python 3.13 venv (`_bootstrap.sh` finds the best Python in your `PATH`)
+2. Installs torch, NeMo (from `@main` — Nemotron-3.5 isn't on PyPI NeMo yet), ctranslate2, fastapi, sherpa-onnx
+3. Downloads the Nemotron ASR model (~2.4 GB) into `.hf-cache/`
+4. Loads the Vietnamese ↔ English translator (run the conversion once with `ct2-transformers-converter` — instructions appear if the directory is missing)
+
+Subsequent runs start in ~30 seconds (model load time).
+
+### Run with noise suppression
+
+If you're in a noisy room (fan, AC, traffic), the silence-VAD has trouble detecting when you've actually paused:
+
+```bash
+./stream_translate.sh --denoise
+```
+
+This uses GTCRN to give the VAD a clean reference signal so pauses commit reliably. The ASR still sees raw audio so Vietnamese tones aren't damaged. GTCRN auto-downloads on first use (~520 KB).
+
+### Run the web UI
+
+```bash
+./stream_web.sh
+# open http://127.0.0.1:8765 in a browser
+```
+
+Same pipeline, different display. Useful for screen-sharing, captioning meetings, or running ASR on a beefy machine and viewing from a phone on the same network.
+
+## Features
+
+- **Streaming, not batched** — partial transcripts appear chunk-by-chunk (560 ms cadence), commits land on natural sentence boundaries
+- **Bidirectional Vi ↔ En translation** with a single small model (~275 M params, int8)
+- **CPU-real-time** on Apple Silicon via ONNX Runtime (encoder exported with cache-state I/O, ~8× speedup over PyTorch)
+- **Drop-in CUDA support** — if `torch.cuda.is_available()`, the ASR runs on GPU automatically
+- **Cross-platform mic capture** — native ALSA on Linux, `sounddevice` shim everywhere else (`alsa_shim.py`)
+- **Session recording + structured logs** — every run writes `logs/audio-<ts>.wav` (raw mic) + `logs/stream-<ts>.log` (per-chunk debug) for offline replay
+- **Backwards-compatible flags** — every default in this README is overridable from the CLI
+- **20+ language support** via the `--translator nllb` backend when you need more than Vi↔En
+
+## Architecture
+
+```
+   mic (16 kHz mono S16)
+      │
+      ▼
+  ┌─────────────────────────────────────────────┐
+  │ MicProducer (background thread)              │
+  │   - alsa_shim or alsaaudio capture           │
+  │   - write RAW to logs/audio-<ts>.wav         │
+  │   - optional: GTCRN denoise -> VAD peak only │
+  │   - bounded ring buffer (--max-buffer-secs)  │
+  └─────────────────────────────────────────────┘
+      │ float32 PCM, 16 kHz mono
+      ▼
+  ┌─────────────────────────────────────────────┐
+  │ Streaming ASR loop (main thread)             │
+  │   - 560 ms chunks                            │
+  │   - CacheAwareStreamingAudioBuffer (NeMo)    │
+  │   - encoder.forward via ONNX Runtime         │
+  │   - RNNT decoder in PyTorch (stateful LSTM)  │
+  │   - cache_last_channel / time / len threaded │
+  │     through every chunk                      │
+  └─────────────────────────────────────────────┘
+      │ partial + final hypotheses
+      ▼
+  ┌─────────────────────────────────────────────┐
+  │ Commit logic                                 │
+  │   - silence VAD (peak<threshold for Ns)      │
+  │   - end-of-utterance <lang> tag              │
+  │   - sentence-final punctuation               │
+  └─────────────────────────────────────────────┘
+      │ committed Vietnamese text
+      ▼
+  ┌─────────────────────────────────────────────┐
+  │ Translator worker (background thread)        │
+  │   - CTranslate2 int8 (EnViT5 or NLLB)        │
+  │   - FINAL queue (committed text) drained 1st │
+  │   - DRAFT slot (latest partial) for live UX  │
+  └─────────────────────────────────────────────┘
+      │ English translation
+      ▼
+   terminal display  |  WebSocket -> browser
+```
+
+## Performance
+
+Measured on M-series MacBook Pro, CPU only, default `560 ms` chunks:
+
+| Stage | PyTorch CPU | ONNX CPU (default) |
+|---|---:|---:|
+| ASR avg chunk time | 921 ms | **114 ms** |
+| ASR RTF | 1.64 | **0.20** |
+| Translator (EnViT5 int8) | 80-200 ms / utterance | same |
+| Denoiser (GTCRN, optional) | — | +30-40 ms / chunk |
+| End-to-end RTF | 1.6+ (lagging) | ~0.25 (real-time) |
+
+See [`docs/performance/`](docs/performance/) for the full ONNX export + integration recipe if you want to reproduce or extend the optimization.
+
+## Common flags
+
+```bash
+# Default — Vi -> En with EnViT5
+./stream_translate.sh
+
+# Different language pair
+./stream_translate.sh --lang en-US --target-lang vi-VN
+./stream_translate.sh --lang ja-JP --target-lang en-US --translator nllb
+
+# Translation-only stack (no live UI)
+./stream_translate.sh --no-translate
+
+# Noisy environment
+./stream_translate.sh --denoise
+
+# Tight latency (faster commits, more fragmentation)
+./stream_translate.sh --silence-secs 0.6 --max-utterance-secs 4
+
+# Dictation mode (longer pauses tolerated, fewer commits)
+./stream_translate.sh --silence-secs 3.0
+
+# Bypass the ONNX encoder (slower; use if ONNX crashes on your CPU)
+NO_ONNX=1 ./stream_translate.sh
+
+# Quiet down NeMo's import-time chatter (default), or restore it
+NEMO_VERBOSE=1 ./stream_translate.sh
+
+# Save audio + log to specific paths
+./stream_translate.sh --record-audio my-session.wav --log-file my-session.log
+```
+
+All flags discoverable via `./stream_translate.sh --help`.
+
+## Project layout
 
 ```
 nemotron-asr/
-├── .venv/          Python 3.11 venv (torch+cu124, nemo_toolkit[asr]) — ~6 GB
-├── .hf-cache/      Hugging Face model cache (~1-2 GB after first run)
-├── audio/          Test clips (LibriSpeech samples from the model card)
-├── model_readme.md Pinned copy of the model card
-├── smoke_test.py   Load model + transcribe sample1.flac, sample2.flac
-└── run.sh          Wrapper: activate venv, set HF_HOME, run smoke_test.py
+├── stream_translate.sh   wrapper: ./stream_translate.py via _bootstrap.sh
+├── stream_translate.py   terminal UI, streaming ASR + translation
+├── stream_web.sh         wrapper: ./stream_web.py
+├── stream_web.py         FastAPI/WebSocket UI, same pipeline
+├── translator.py         NLLBTranslator + EnViT5Translator + factory
+├── onnx_encoder.py       ONNX Runtime wrapper for the Conformer encoder
+├── denoiser.py           sherpa-onnx GTCRN wrapper (optional --denoise)
+├── alsa_shim.py          sounddevice fallback for non-Linux platforms
+├── _bootstrap.sh         sourced by every wrapper; ensures .venv exists
+├── requirements.txt      pinned deps incl. NeMo @ git main
+├── smoke_test.py         file-based ASR smoke (no mic needed)
+├── mic_to_asr_test.sh    record N seconds, transcribe, print result
+├── audio/                bundled LibriSpeech samples + your bench wavs
+├── bench/                RTF / WER measurement scripts + saved results
+├── docs/
+│   ├── training/         Vietnamese fine-tuning workflow (5 chapters)
+│   └── performance/      ONNX + INT8 + CoreML perf workflow (5 chapters)
+├── logs/                 per-session debug logs + raw audio recordings
+└── models/               ONNX encoder + GTCRN denoiser (auto-generated)
 ```
 
-Everything project-local. `~/.cache/pip` may hold extra wheels but isn't required for runtime.
+## Documentation
 
-## Usage
+- [`docs/training/`](docs/training/) — Improving Vietnamese ASR accuracy: baseline measurement, post-processing diacritic restoration, KenLM rescoring, LoRA fine-tuning, deploy.
+- [`docs/performance/`](docs/performance/) — CPU performance: ONNX encoder export with cache I/O, FP16/INT8 trade-offs, integration, benchmark, fallback to smaller models.
 
-```bash
-./run.sh
-```
+## License
 
-Or manually:
+This project: **MIT** ([LICENSE](LICENSE)).
 
-```bash
-source .venv/bin/activate
-export HF_HOME="$PWD/.hf-cache"
-python smoke_test.py
-```
+The models you load through it have their own licenses — all are commercially usable, with one caveat:
 
-## Streaming inference
+| Component | License | Commercial use? |
+|---|---|---|
+| This code | MIT | Yes |
+| Nemotron-3.5 ASR | NVIDIA Open Model License | Yes (read the NVIDIA OML terms) |
+| EnViT5 (default translator) | OpenRAIL-M | Yes (with use-case restrictions — no surveillance, harassment, etc.) |
+| NLLB-200 (alternate translator) | MIT | Yes |
+| GTCRN denoiser | MIT (via [Xiaobin-Rong/gtcrn](https://github.com/Xiaobin-Rong/gtcrn)) | Yes |
+| sherpa-onnx runtime | Apache 2.0 | Yes |
+| NeMo toolkit | Apache 2.0 | Yes |
 
-For the full cache-aware streaming pipeline, see NeMo's reference script:
-`examples/asr/asr_cache_aware_streaming/speech_to_text_cache_aware_streaming_infer.py`
-in the [NeMo repo](https://github.com/NVIDIA/NeMo).
+If you swap the translator for **vinai-translate-vi2en-v2** instead of the default EnViT5: it is **AGPL-3.0**. Any network-accessible service calling it must release its server source — typically a deal-breaker for SaaS. Use EnViT5 (the default) for commercial work.
+
+## Credits
+
+- **NVIDIA NeMo team** — Nemotron-3.5 streaming ASR model + the streaming framework this is built on
+- **Meta AI** — NLLB-200 translation model
+- **VietAI** — EnViT5 Vietnamese translator and the MTet corpus that trained it
+- **VinAI** — PhoMT corpus and reference work that made Vietnamese ASR/NMT measurable
+- **k2-fsa / Xiaobin Rong** — sherpa-onnx + GTCRN noise suppression
+- **The Vietnamese NLP community** — for keeping low-resource speech research alive
+
+## Contributing
+
+Bug reports, language-pair extensions, and benchmark numbers from your machine are welcome. The codebase is small (~3 kloc) and deliberately approachable — every file is < 800 lines and the wrappers are 5 lines each.
+
+If you ship a quality improvement (better translator, smaller/faster ASR, real-time GPU benchmarks), please open a PR with before/after `bench/rtf_*.json` and `bench/wer_*.json` files so we can compare apples to apples.
