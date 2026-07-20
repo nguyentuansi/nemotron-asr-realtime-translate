@@ -1,0 +1,62 @@
+# Wake-word training data manifest.
+#
+# Data sources are PLUGGABLE — add / remove / re-weight sources here, no code
+# change needed. The training pipeline (scripts/wake_pipeline.py) reads this
+# file to know what to consume for positives and negatives.
+#
+# Each source has:
+#   path       — directory of .wav files (16 kHz mono preferred, resampled otherwise)
+#   weight     — sampling weight relative to other sources. Real recordings are
+#                more valuable than synthetic, so weight them higher.
+#   enabled    — true/false. Skip a source without deleting it.
+#
+# When you start collecting real "Nemo ơi" recordings from friends/family,
+# drop them into data/wake/positive_real/ (16 kHz mono wav, 1-2s each) and
+# re-run `./nemo.sh wake-train train`. No changes to this file needed unless
+# you want to boost their weight further.
+
+wake_phrase: "Nemo ơi"
+
+positives:
+  - name: synth_piper
+    path: data/wake/positive_synth
+    weight: 1.0
+    enabled: true
+    description: "Piper-synthesized 'Nemo ơi' with pitch/speed/noise augmentation."
+
+  - name: real_recordings
+    path: data/wake/positive_real
+    weight: 4.0        # real recordings are ~4× more valuable per clip
+    enabled: true
+    description: "Real 'Nemo ơi' clips from you + friends/family. Drop wavs in."
+
+negatives:
+  - name: synth_piper_vi_phrases
+    path: data/wake/negative_synth
+    weight: 1.0
+    enabled: true
+    description: "Piper-synthesized Vietnamese phrases that aren't the wake word."
+
+  - name: real_speech_corpus
+    path: data/wake/negative_real
+    weight: 3.0
+    enabled: true
+    description: "Real Vietnamese speech (e.g. Common Voice VI). Drop wavs in."
+
+# Training hyperparameters. Sensible defaults; tune if FRR/FAR miss target.
+training:
+  # Model input: (batch, 16 frames, 96 dims) — matches openWakeWord's Model.predict.
+  n_frames: 16
+  n_dims: 96
+
+  # Classifier size. Bigger = fits training data better + overfits faster.
+  hidden_dim: 64
+
+  epochs: 200
+  batch_size: 512
+  learning_rate: 0.001
+  weight_decay: 0.00001
+
+  # Where to save the trained model. WakeGate defaults to this path.
+  output_path: models/wake/nemo_oi.onnx
+  wake_word_key: nemo_oi

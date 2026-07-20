@@ -18,6 +18,49 @@ languages** via NLLB. Runs on a MacBook CPU. No API keys. No cloud.
 sub-second latency, defaults tuned for tone-language speech — but the same
 pipeline drives any other pair via `--lang` and `--target-lang`.
 
+## Assistant mode — "Nemo ơi" (v0 scaffold)
+
+The streaming pipeline also underpins a Vietnamese voice assistant. Say
+**"Nemo ơi"** to wake it, then a command — time, alarms, translate,
+Home Assistant control. All local. No accounts. Rule-based intent routing;
+LLM chit-chat deferred to v2.
+
+```bash
+./assistant.sh                    # start assistant (terminal)
+./assistant.sh --setup            # first-run wizard (writes ~/.config/nemo-assistant.yaml)
+./assistant.sh --wake-only        # test wake detection without ASR
+./assistant.sh --no-tts           # print responses to stdout instead of speaking
+```
+
+Skills shipped in v0:
+
+| Skill | Example command | Response |
+|---|---|---|
+| Time / date | "Nemo ơi, mấy giờ rồi?" | "Bây giờ là tám giờ ba mươi phút sáng" |
+| Alarms & timers | "Nemo ơi, đặt báo thức 6 giờ sáng" | "Đã đặt báo thức lúc sáu giờ sáng" |
+| Translate (any of 200 langs) | "Nemo ơi, dịch sang tiếng Anh: xin chào bạn" | "Hello, friend" |
+| Home Assistant | "Nemo ơi, tắt đèn phòng khách" | "Đã tắt đèn phòng khách" |
+
+**Two ways to get to the always-on experience:**
+
+```bash
+# Immediate: push-to-talk (no wake model needed — press ENTER each turn)
+./nemo.sh ptt
+
+# Full: train a "Nemo ơi" wake model from Piper-synthesized data
+./nemo.sh wake-train all          # ~30-60 min, fully automated
+./nemo.sh assistant               # then say "Nemo ơi"
+```
+
+The training pipeline is **pluggable via `data/wake/manifest.yaml`** — start
+with 100% synthetic data (default), add real recordings to
+`data/wake/positive_real/` when you have them, and re-run `wake-train train`.
+Real recordings are weighted 4× per file so even ~50 improve the model
+meaningfully. Full design walkthrough in
+**[docs/assistant/01-wake-word-training.md](docs/assistant/01-wake-word-training.md)**,
+plus the whole assistant story in
+**[docs/assistant/00-build-story.md](docs/assistant/00-build-story.md)**.
+
 ## Stack at a glance
 
 | Layer | Choice | Why |
@@ -80,12 +123,36 @@ This repo is the open answer: **any of Nemotron's 19 source languages → any of
 
 **The Vi↔En path is the polished showcase** because that's the niche the project was anchored to — defaults are tuned for tone-language speech, the EnViT5 translator was picked specifically because it beats NLLB on Vi↔En per PhoMT/MTet benchmarks, and the silence/punctuation commit logic was tested against Vietnamese sentence patterns. Other language pairs work today via the NLLB backend; treat them as well-supported but less custom-tuned. PRs improving any other pair are welcome.
 
+## One entry point for everything
+
+Every mode of the project runs through **`./nemo.sh`**:
+
+```bash
+./nemo.sh                         # interactive menu
+./nemo.sh --help                  # list every command
+./nemo.sh stream                  # ASR + translation, terminal UI
+./nemo.sh web                     # same, browser at :8765
+./nemo.sh assistant               # voice assistant ("Nemo ơi")
+./nemo.sh setup                   # first-run wizard for the assistant
+./nemo.sh mic-test 5              # 5-second mic → ASR round-trip
+./nemo.sh bench rtf               # ASR real-time-factor benchmark
+./nemo.sh bench wake              # wake-word FAR/FRR benchmark
+./nemo.sh smoke                   # smoke test on bundled audio (no mic)
+./nemo.sh regress                 # end-to-end assistant regression
+./nemo.sh wake-train prepare      # generate synthetic wake-word data
+```
+
+Any flags after the subcommand pass through to the underlying script, e.g.
+`./nemo.sh stream --translator nllb --lang vi-VN` or
+`./nemo.sh assistant --no-tts`. The individual wrappers (`stream_translate.sh`,
+`assistant.sh`, …) keep working standalone; `nemo.sh` just dispatches.
+
 ## Quick start
 
 ```bash
 git clone https://github.com/nguyentuansi/nemotron-asr-realtime-translate.git
 cd nemotron-asr-realtime-translate
-./stream_translate.sh
+./nemo.sh
 ```
 
 That's it. First run does ~10 minutes of one-time setup:
